@@ -139,6 +139,70 @@ func DiscoverAndRegisterOneMinAIModels(ctx context.Context, db *pgxpool.Pool, va
 	return len(discoveredModels), discoveredModels, tx.Commit(ctx)
 }
 
+// DiscoverAndRegisterOneMinAIModelsBatch processes multiple 1min.ai API keys one
+// by one against the full 1min.ai static model catalog. Keys are deduplicated
+// and trimmed while preserving order. A failing key (invalid key, network
+// error, …) is recorded in the results and does NOT abort the batch — the
+// remaining keys still get discovered and bound, exactly like the custom and
+// Puter batch flows. Each valid key is inserted atomically into the
+// credentials table and bound to every manifest model pool for round-robin
+// load balancing.
+func DiscoverAndRegisterOneMinAIModelsBatch(
+	ctx context.Context,
+	db *pgxpool.Pool,
+	vault *Vault,
+	apiKeys []string,
+	weight int,
+) (totalKeys, successCount, failedCount, totalModels int, results []BatchKeyDiscoveryResult, allDiscovered []string, err error) {
+	// Deduplicate and trim keys while preserving order.
+	seenKeys := make(map[string]bool)
+	var cleanKeys []string
+	for _, raw := range apiKeys {
+		k := strings.TrimSpace(raw)
+		if k != "" && !seenKeys[k] {
+			seenKeys[k] = true
+			cleanKeys = append(cleanKeys, k)
+		}
+	}
+
+	if len(cleanKeys) == 0 {
+		return 0, 0, 0, 0, nil, nil, fmt.Errorf("no valid 1min.ai API keys provided")
+	}
+
+	totalKeys = len(cleanKeys)
+	results = make([]BatchKeyDiscoveryResult, 0, totalKeys)
+	discoveredMap := make(map[string]bool)
+
+	for i, k := range cleanKeys {
+		res := BatchKeyDiscoveryResult{
+			Index:     i + 1,
+			KeyMasked: MaskAPIKey(k),
+		}
+
+		count, models, dErr := DiscoverAndRegisterOneMinAIModels(ctx, db, vault, k, weight)
+		if dErr != nil {
+			res.Success = false
+			res.Error = dErr.Error()
+			failedCount++
+		} else {
+			res.Success = true
+			res.ModelsCount = count
+			res.DiscoveredIDs = models
+			successCount++
+			for _, m := range models {
+				if !discoveredMap[m] {
+					discoveredMap[m] = true
+					allDiscovered = append(allDiscovered, m)
+				}
+			}
+		}
+		results = append(results, res)
+	}
+
+	totalModels = len(allDiscovered)
+	return totalKeys, successCount, failedCount, totalModels, results, allDiscovered, nil
+}
+
 // validateOneMinAIKey sends a minimal chat request to 1min.ai to confirm the
 // API key is valid. This consumes a tiny amount of credits but is the most
 // reliable validation method since 1min.ai has no dedicated key-check endpoint.

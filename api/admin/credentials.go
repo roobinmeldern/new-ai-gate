@@ -638,33 +638,60 @@ func (h *CredentialHandler) RegisterCustomProvider(c *gin.Context) {
 
 // RegisterOneMinAIProvider auto-discovers all models available on 1min.ai
 // across all five modalities (chat, code, image, audio, video), creates model
-// pools for each, and binds the credential to all of them in one transaction.
+// pools for each, and binds the credential to all of them in one transaction
+// per key.
 //
-// 1min.ai does not expose a /v1/models endpoint, so the full catalog is maintained
-// as a static manifest. The API key is validated via a lightweight chat request
-// before registration begins. Adding the provider requires only the API key —
-// the base URL is hardcoded to https://api.1min.ai.
+// Bulk registration is supported: pass an array of keys via api_keys (or a
+// newline/comma-separated list in api_key). Keys are processed one by one — a
+// failing key is reported in the results without aborting the batch, and every
+// valid key is inserted into the credentials table bound to the full 1min.ai
+// manifest catalog for round-robin load balancing. 1min.ai does not expose a
+// /v1/models endpoint, so the catalog comes from a static manifest and each
+// key is validated via a lightweight chat request before registration. The
+// base URL is hardcoded to https://api.1min.ai.
 //
 // @Summary      Auto-discover 1min.ai Models
-// @Description  Submits a 1min.ai key, validates it, and registers all models across all modalities automatically
+// @Description  Submits one or more 1min.ai keys and registers all models across all modalities automatically
 // @Tags         Credentials
 // @Accept       json
 // @Produce      json
 // @Security     BearerAuth
-// @Param        body  body      dto.DiscoverProviderRequest  true  "1min.ai provider details (api_key required, base_url ignored)"
+// @Param        body  body      dto.DiscoverOneMinAIRequest  true  "1min.ai provider details (api_key or api_keys required, base_url ignored)"
 // @Success      200   {object}  dto.DiscoverProviderResponse
 // @Failure      400   {object}  dto.ErrorResponse
 // @Failure      500   {object}  dto.ErrorResponse
 // @Router       /api/v1/admin/providers/1minai [post]
 func (h *CredentialHandler) RegisterOneMinAIProvider(c *gin.Context) {
-	var req dto.DiscoverProviderRequest
+	var req dto.DiscoverOneMinAIRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, dto.ErrorResponse{Error: "invalid request body", Details: err.Error()})
 		return
 	}
 
-	if req.APIKey == "" {
-		c.JSON(http.StatusBadRequest, dto.ErrorResponse{Error: "api_key is required for 1min.ai auto-discovery"})
+	// Collect keys: prefer the explicit api_keys array, then fall back to
+	// newline/comma-separated keys in api_key.
+	var keys []string
+	for _, k := range req.APIKeys {
+		k = strings.TrimSpace(k)
+		if k != "" {
+			keys = append(keys, k)
+		}
+	}
+
+	if len(keys) == 0 && req.APIKey != "" {
+		rawKeys := strings.FieldsFunc(req.APIKey, func(r rune) bool {
+			return r == '\n' || r == '\r' || r == ','
+		})
+		for _, rk := range rawKeys {
+			rk = strings.TrimSpace(rk)
+			if rk != "" {
+				keys = append(keys, rk)
+			}
+		}
+	}
+
+	if len(keys) == 0 {
+		c.JSON(http.StatusBadRequest, dto.ErrorResponse{Error: "api_key or api_keys is required for 1min.ai auto-discovery"})
 		return
 	}
 
@@ -672,26 +699,75 @@ func (h *CredentialHandler) RegisterOneMinAIProvider(c *gin.Context) {
 		req.Weight = 1
 	}
 
-	count, models, err := credentials.DiscoverAndRegisterOneMinAIModels(
-		c.Request.Context(),
-		h.db,
-		h.vault,
-		req.APIKey,
-		req.Weight,
-	)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, dto.ErrorResponse{Error: "1min.ai auto-discovery failed", Details: err.Error()})
+	// Single key workflow (legacy response shape).
+	if len(keys) == 1 && len(req.APIKeys) == 0 {
+		count, models, err := credentials.DiscoverAndRegisterOneMinAIModels(
+			c.Request.Context(),
+			h.db,
+			h.vault,
+			keys[0],
+			req.Weight,
+		)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, dto.ErrorResponse{Error: "1min.ai auto-discovery failed", Details: err.Error()})
+			return
+		}
+
+		c.JSON(http.StatusOK, dto.DiscoverProviderResponse{
+			Message:       fmt.Sprintf("Successfully synchronized %d 1min.ai models across all modalities", count),
+			ModelsCount:   count,
+			DiscoveredIDs: models,
+		})
+
+		// Synchronously reload caches so all cluster nodes instantly see newly registered 1min.ai models.
+		h.syncCaches(c.Request.Context())
 		return
 	}
 
+	// Batch keys workflow: each key is processed one by one; failures are
+	// reported per key without aborting the remaining keys.
+	totalKeys, successCount, failedCount, totalModels, results, allDiscovered, err := credentials.DiscoverAndRegisterOneMinAIModelsBatch(
+		c.Request.Context(),
+		h.db,
+		h.vault,
+		keys,
+		req.Weight,
+	)
+	if err != nil && successCount == 0 {
+		c.JSON(http.StatusInternalServerError, dto.ErrorResponse{Error: "1min.ai batch auto-discovery failed", Details: err.Error()})
+		return
+	}
+
+	batchResults := make([]dto.BatchKeyResult, len(results))
+	for i, r := range results {
+		batchResults[i] = dto.BatchKeyResult{
+			Index:         r.Index,
+			KeyMasked:     r.KeyMasked,
+			Success:       r.Success,
+			ModelsCount:   r.ModelsCount,
+			DiscoveredIDs: r.DiscoveredIDs,
+			Error:         r.Error,
+		}
+	}
+
+	msg := fmt.Sprintf("Successfully synchronized %d unique 1min.ai models across %d of %d keys", totalModels, successCount, totalKeys)
+	if failedCount > 0 {
+		msg = fmt.Sprintf("Batch discovery completed: %d of %d keys succeeded, %d failed (%d unique models synchronized)", successCount, totalKeys, failedCount, totalModels)
+	}
+
 	c.JSON(http.StatusOK, dto.DiscoverProviderResponse{
-		Message:       fmt.Sprintf("Successfully synchronized %d 1min.ai models across all modalities", count),
-		ModelsCount:   count,
-		DiscoveredIDs: models,
+		Message:       msg,
+		ModelsCount:   totalModels,
+		DiscoveredIDs: allDiscovered,
+		TotalKeys:     totalKeys,
+		SuccessCount:  successCount,
+		FailedCount:   failedCount,
+		Results:       batchResults,
 	})
 
-	// Synchronously reload caches so all cluster nodes instantly see newly registered 1min.ai models.
-	h.syncCaches(c.Request.Context())
+	if successCount > 0 {
+		h.syncCaches(c.Request.Context())
+	}
 }
 
 // RegisterCloudflareProvider auto-discovers all Cloudflare Workers AI models

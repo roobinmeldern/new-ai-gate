@@ -219,6 +219,17 @@ type DiscoverPuterRequest struct {
 	Weight  int      `json:"weight,omitempty" example:"1"`
 }
 
+// DiscoverOneMinAIRequest is the request body for POST /api/v1/admin/providers/1minai.
+// 1min.ai only needs an API key — the base URL is hardcoded to https://api.1min.ai.
+// Bulk registration is supported via api_keys (array) or newline/comma-separated
+// keys in api_key; each key is validated with a lightweight chat request and
+// then bound to all manifest model pools (all modalities) one by one.
+type DiscoverOneMinAIRequest struct {
+	APIKey  string   `json:"api_key,omitempty" example:"..."`
+	APIKeys []string `json:"api_keys,omitempty"`
+	Weight  int      `json:"weight,omitempty" example:"1"`
+}
+
 // DiscoverAgentRouterRequest is the request body for POST /api/v1/admin/providers/agentrouter.
 // AgentRouter only needs an API key — the base URL is hardcoded to
 // https://ps.air-outer.com/v1. Multiple keys can be added for round-robin rotation
@@ -243,6 +254,7 @@ type DiscoverGeminiRequest struct {
 	APIKey string `json:"api_key" binding:"required" example:"AIzaSy..."`
 	Weight int    `json:"weight,omitempty" example:"1"`
 }
+
 // BulkDeleteRequest represents a request containing multiple IDs to be deleted.
 type BulkDeleteRequest struct {
 	IDs []int `json:"ids" binding:"required,min=1" example:"[1,2,3]"`
@@ -252,5 +264,4 @@ type BulkDeleteRequest struct {
 type BulkActivateRequest struct {
 	IDs []int `json:"ids" binding:"required,min=1" example:"[1,2,3]"`
 }
-
 
