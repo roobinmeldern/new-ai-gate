@@ -209,7 +209,10 @@ func TestCoerceToJSONObject(t *testing.T) {
 }
 
 func TestIsGemini3Model(t *testing.T) {
-	cases := []struct{ model string; want bool }{
+	cases := []struct {
+		model string
+		want  bool
+	}{
 		{"gemini-3.5-flash", true},
 		{"gemini-3-pro-preview", true},
 		{"gemini-3.1-flash-lite", true},

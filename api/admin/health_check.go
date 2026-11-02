@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/skadraneshghn/clever-ai-gate/api/dto"
+	"github.com/skadraneshghn/clever-ai-gate/internal/credentials"
 	"github.com/skadraneshghn/clever-ai-gate/internal/jobs"
 	"go.uber.org/zap"
 )
@@ -17,14 +18,16 @@ import (
 // real-time SSE streaming, and session history/details retrieval.
 type HealthCheckHandler struct {
 	db          *pgxpool.Pool
+	vault       *credentials.Vault
 	logger      *zap.Logger
 	broadcaster chan jobs.HealthCheckSSEEvent
 }
 
 // NewHealthCheckHandler creates a new admin health check handler.
-func NewHealthCheckHandler(db *pgxpool.Pool, logger *zap.Logger, b chan jobs.HealthCheckSSEEvent) *HealthCheckHandler {
+func NewHealthCheckHandler(db *pgxpool.Pool, vault *credentials.Vault, logger *zap.Logger, b chan jobs.HealthCheckSSEEvent) *HealthCheckHandler {
 	return &HealthCheckHandler{
 		db:          db,
+		vault:       vault,
 		logger:      logger,
 		broadcaster: b,
 	}
@@ -41,7 +44,7 @@ func NewHealthCheckHandler(db *pgxpool.Pool, logger *zap.Logger, b chan jobs.Hea
 // @Failure      500  {object}  dto.ErrorResponse
 // @Router       /api/v1/admin/health-check/trigger [post]
 func (h *HealthCheckHandler) TriggerHealthCheck(c *gin.Context) {
-	job := jobs.NewExhaustiveHealthCheckJob(h.db, h.logger, h.broadcaster)
+	job := jobs.NewExhaustiveHealthCheckJob(h.db, h.vault, h.logger, h.broadcaster)
 
 	go func() {
 		// Run in background with context.Background() since HTTP request context will be closed when handler returns

@@ -75,9 +75,9 @@ func TestExactModelCrossProviderFallback_Success(t *testing.T) {
 	// SyncManager setup
 	sm := credentials.NewSyncManager(nil, cacheStore, nil, logger)
 	sm.SetPools(map[string]*credentials.BalancedChannelPool{
-		"nvidia/meta/llama-3.3-70b-instruct":          nvidiaPool,
+		"nvidia/meta/llama-3.3-70b-instruct":           nvidiaPool,
 		"openrouter/meta-llama/llama-3.3-70b-instruct": orPool,
-		"puter/gpt-4o-mini":                           puterPool,
+		"puter/gpt-4o-mini":                            puterPool,
 	})
 
 	var calledProviders []string
@@ -234,9 +234,9 @@ func TestExactModelFallback_NoArbitraryDowngrade_ThrowsError(t *testing.T) {
 
 	sm := credentials.NewSyncManager(nil, cacheStore, nil, logger)
 	sm.SetPools(map[string]*credentials.BalancedChannelPool{
-		"nvidia/meta/llama-3.3-70b-instruct":          nvidiaPool,
+		"nvidia/meta/llama-3.3-70b-instruct":           nvidiaPool,
 		"openrouter/meta-llama/llama-3.1-70b-instruct": differentVersionPool,
-		"puter/gpt-4o-mini":                           puterPool,
+		"puter/gpt-4o-mini":                            puterPool,
 	})
 
 	calledProviders := 0

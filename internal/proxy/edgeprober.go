@@ -29,15 +29,15 @@ const (
 // The hot-path lookup (GetFastestIP) uses an RWMutex read lock —
 // sub-nanosecond contention-free.
 type EdgeProber struct {
-	mu          sync.RWMutex
-	fastestIP   map[string]string
-	hosts       []string
-	probeInt    time.Duration
-	probeTO     time.Duration
-	warmInt     time.Duration
-	logger      *zap.Logger
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
+	mu        sync.RWMutex
+	fastestIP map[string]string
+	hosts     []string
+	probeInt  time.Duration
+	probeTO   time.Duration
+	warmInt   time.Duration
+	logger    *zap.Logger
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
 }
 
 // NewEdgeProber creates an edge prober for the given comma-separated host list.

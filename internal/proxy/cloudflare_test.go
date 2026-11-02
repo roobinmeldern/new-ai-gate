@@ -96,11 +96,11 @@ func TestTranslateCloudflareImageResponse_MissingImage(t *testing.T) {
 
 func TestIsCloudflareImageRequest(t *testing.T) {
 	cases := map[string]bool{
-		"/v1/images/generations":     true,
-		"/v1/images/edits":           true,
-		"/v1/chat/completions":       false,
-		"/v1/embeddings":             false,
-		"/v1/audio/speech":           false,
+		"/v1/images/generations": true,
+		"/v1/images/edits":       true,
+		"/v1/chat/completions":   false,
+		"/v1/embeddings":         false,
+		"/v1/audio/speech":       false,
 	}
 	for path, want := range cases {
 		if got := isCloudflareImageRequest(path); got != want {
@@ -200,14 +200,14 @@ func TestSanitizeCloudflareRequest_VisionWithoutText(t *testing.T) {
 
 func TestIsCloudflareNativeVisionModel(t *testing.T) {
 	cases := map[string]bool{
-		"@cf/meta/llama-3.2-11b-vision-instruct": true,
-		"@cf/meta/llama-3.2-90b-vision-instruct": true,
-		"@cf/llava-hf/llava-1.5-7b-hf":           true,
-		"@cf/unum/uform-gen2-qwen-500m":          true,
+		"@cf/meta/llama-3.2-11b-vision-instruct":            true,
+		"@cf/meta/llama-3.2-90b-vision-instruct":            true,
+		"@cf/llava-hf/llava-1.5-7b-hf":                      true,
+		"@cf/unum/uform-gen2-qwen-500m":                     true,
 		"cloudflare/@cf/meta/llama-3.2-11b-vision-instruct": true,
-		"@cf/meta/llama-3.1-8b-instruct":         false,
-		"@cf/stabilityai/stable-diffusion-xl-base-1.0": false,
-		"openai/gpt-4o":                          false,
+		"@cf/meta/llama-3.1-8b-instruct":                    false,
+		"@cf/stabilityai/stable-diffusion-xl-base-1.0":      false,
+		"openai/gpt-4o": false,
 	}
 
 	for model, want := range cases {
@@ -279,6 +279,3 @@ func TestTranslateCloudflareVisionResponse(t *testing.T) {
 		t.Errorf("expected model @cf/meta/llama-3.2-11b-vision-instruct, got %s", model)
 	}
 }
-
-
-

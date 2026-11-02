@@ -138,8 +138,10 @@ func NewEngine(deps *Dependencies) *gin.Engine {
 			}
 
 			c.JSON(200, gin.H{
-				"admin_key":  deps.Config.AdminAPIKey,
-				"tenant_key": tenantKey,
+				"admin_key":          deps.Config.AdminAPIKey,
+				"tenant_key":         tenantKey,
+				"anthropic_endpoint": "/v1/messages",
+				"openai_endpoint":    "/v1/chat/completions",
 			})
 		})
 	}
@@ -147,6 +149,13 @@ func NewEngine(deps *Dependencies) *gin.Engine {
 	// --- Proxy routes (minimal middleware for maximum throughput) ---
 	proxyGroup := engine.Group("")
 	{
+		// CORS + OPTIONS preflight handling for browser-based clients.
+		// Browser Anthropic SDKs targeting /v1/messages send x-api-key /
+		// anthropic-version / anthropic-beta headers, which trigger CORS
+		// preflights that must be answered before auth runs (they carry no
+		// API key). Must be registered before the auth middleware.
+		proxyGroup.Use(middleware.CORS())
+
 		// Auth: prefer two-layer Ristretto+Redis cache when available; accepts Admin key for playground
 		if deps.TenantCache != nil {
 			proxyGroup.Use(middleware.ProxyAuthWithRedis(deps.TenantCache, deps.Config.AdminAPIKey))
@@ -169,7 +178,27 @@ func NewEngine(deps *Dependencies) *gin.Engine {
 		// All routes use the same proxy handler — model-based routing
 		// is determined by the "model" field in the JSON body, not the URL path.
 		proxyGroup.POST("/v1/*proxyPath", deps.Proxy.Handle)
+		proxyGroup.POST("/messages", deps.Proxy.Handle)
+		proxyGroup.POST("/messages/*proxyPath", deps.Proxy.Handle)
 		proxyGroup.GET("/v1/models", deps.Proxy.ListModels)
+		proxyGroup.GET("/v1/models/*model", deps.Proxy.GetModel)
+		proxyGroup.GET("/models", deps.Proxy.ListModels)
+		proxyGroup.GET("/models/*model", deps.Proxy.GetModel)
+
+		// CORS preflight route: browsers send OPTIONS before any authenticated
+		// request. The CORS middleware registered above intercepts OPTIONS and
+		// answers 204 + the allow headers before auth/rate-limit run — this
+		// route only exists so Gin does not answer preflights with 404
+		// (Gin routes by method).
+		proxyGroup.OPTIONS("/v1/*proxyPath", func(c *gin.Context) {
+			c.Status(http.StatusNoContent)
+		})
+		proxyGroup.OPTIONS("/messages", func(c *gin.Context) {
+			c.Status(http.StatusNoContent)
+		})
+		proxyGroup.OPTIONS("/messages/*proxyPath", func(c *gin.Context) {
+			c.Status(http.StatusNoContent)
+		})
 
 		// Playground Chats CRUD (Tenant-isolated, requires tenant API Key)
 		chatHandler := admin.NewChatHandler(deps.DB)
@@ -251,7 +280,7 @@ func NewEngine(deps *Dependencies) *gin.Engine {
 		adminGroup.GET("/metrics", metricsCtrl.GetDashboardStats)
 
 		// Exhaustive Model Health Check & Real-time SSE Monitor
-		hcHandler := admin.NewHealthCheckHandler(deps.DB, deps.Logger, deps.HealthCheckBroadcaster)
+		hcHandler := admin.NewHealthCheckHandler(deps.DB, deps.Vault, deps.Logger, deps.HealthCheckBroadcaster)
 		adminGroup.POST("/health-check/trigger", hcHandler.TriggerHealthCheck)
 		adminGroup.GET("/health-check/stream", hcHandler.StreamHealthCheckSSE)
 		adminGroup.GET("/health-check/sessions", hcHandler.GetSessions)

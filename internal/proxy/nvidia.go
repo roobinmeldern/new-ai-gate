@@ -19,15 +19,15 @@ import (
 // and coding assistants (Cline, Continue, Kilo Code, …) silently include in
 // every request regardless of the target provider.
 var nvidiaUnsupportedFields = []string{
-	"stream_options",       // OpenAI streaming usage metadata (usage_on_every_chunk etc.)
-	"logprobs",             // OpenAI per-token log probabilities
-	"top_logprobs",         // OpenAI top-N log probabilities
-	"service_tier",         // OpenAI priority routing tier
-	"store",                // OpenAI conversation storage flag
-	"metadata",             // OpenAI request metadata object
-	"parallel_tool_calls",  // OpenAI parallel function-calling flag
-	"logit_bias",           // OpenAI per-token logit bias map
-	"suffix",               // OpenAI text-completion suffix
+	"stream_options",      // OpenAI streaming usage metadata (usage_on_every_chunk etc.)
+	"logprobs",            // OpenAI per-token log probabilities
+	"top_logprobs",        // OpenAI top-N log probabilities
+	"service_tier",        // OpenAI priority routing tier
+	"store",               // OpenAI conversation storage flag
+	"metadata",            // OpenAI request metadata object
+	"parallel_tool_calls", // OpenAI parallel function-calling flag
+	"logit_bias",          // OpenAI per-token logit bias map
+	"suffix",              // OpenAI text-completion suffix
 }
 
 // sanitizeNvidiaRequest removes OpenAI-only request fields that NVIDIA NIM's strict

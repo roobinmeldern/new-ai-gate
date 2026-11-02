@@ -1,12 +1,20 @@
 {
   "apps": [
     {
-      "app_id": "app_35199071-4dba-4838-b8ac-ae43dc841872",
-      "org_id": "user_9adddbb5-29c6-4829-9061-b8db6c0053c3",
-      "deploy_url": "https://github.com/skadraneshghn/clever-ai-gate.git",
-      "git_ssh_url": "https://github.com/skadraneshghn/clever-ai-gate.git",
+      "app_id": "app_0de5b2a2-abd6-4ea8-bd15-aff5044f73f6",
+      "org_id": "user_103b1d12-ec2c-481a-a468-1039a98f06e5",
+      "deploy_url": "https://github.com/oliforman/clever-ai-gate.git",
+      "git_ssh_url": "https://github.com/oliforman/clever-ai-gate.git",
       "name": "clever-ai-gate",
       "alias": "clever-ai-gate"
+    },
+    {
+      "app_id": "app_395da162-d350-4902-91cf-0398205fbc42",
+      "org_id": "user_dff7c4b9-f7bd-435a-91b4-4b657621bb28",
+      "deploy_url": "https://github.com/roobinmeldern/new-ai-gate.git",
+      "git_ssh_url": "https://github.com/roobinmeldern/new-ai-gate.git",
+      "name": "new-ai-gate",
+      "alias": "new-ai-gate"
     }
   ]
 }

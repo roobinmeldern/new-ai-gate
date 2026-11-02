@@ -722,5 +722,3 @@ func TestTranslateAgentRouterResponseEmptyToolID(t *testing.T) {
 		t.Errorf("expected finish_reason 'tool_calls', got %v", choice0["finish_reason"])
 	}
 }
-
-

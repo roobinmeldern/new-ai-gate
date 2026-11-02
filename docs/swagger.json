@@ -849,6 +849,167 @@
                 ],
                 "responses": {}
             }
+        },
+        "/v1/messages": {
+            "post": {
+                "description": "Anthropic Messages API — handles streaming SSE and non-streaming requests across any configured model pool",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json",
+                    "text/event-stream"
+                ],
+                "tags": [
+                    "Anthropic Front API"
+                ],
+                "summary": "Create an Anthropic Message",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Anthropic API Key (virtual API key)",
+                        "name": "x-api-key",
+                        "in": "header",
+                        "required": false
+                    },
+                    {
+                        "type": "string",
+                        "description": "Anthropic Version Header (e.g. 2023-06-01)",
+                        "name": "anthropic-version",
+                        "in": "header",
+                        "required": false
+                    },
+                    {
+                        "type": "string",
+                        "description": "Bearer virtual-api-key (optional alternative to x-api-key)",
+                        "name": "Authorization",
+                        "in": "header",
+                        "required": false
+                    },
+                    {
+                        "description": "Anthropic Messages Request Payload",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "type": "object"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Anthropic Message response (or SSE stream)",
+                        "schema": {
+                            "type": "object"
+                        }
+                    }
+                }
+            }
+        },
+        "/v1/messages/count_tokens": {
+            "post": {
+                "description": "Anthropic Count Tokens API — returns estimated input tokens",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Anthropic Front API"
+                ],
+                "summary": "Count tokens for an Anthropic Message request",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Anthropic API Key",
+                        "name": "x-api-key",
+                        "in": "header",
+                        "required": false
+                    },
+                    {
+                        "type": "string",
+                        "description": "Anthropic Version Header",
+                        "name": "anthropic-version",
+                        "in": "header",
+                        "required": false
+                    },
+                    {
+                        "description": "Anthropic Request Payload",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "type": "object"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Input tokens estimation",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "input_tokens": {
+                                    "type": "integer"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/v1/models": {
+            "get": {
+                "description": "List configured active model pools with detected capabilities in dual OpenAI & Anthropic compatible format",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Models"
+                ],
+                "summary": "List models",
+                "responses": {
+                    "200": {
+                        "description": "Model list with OpenAI and Anthropic fields",
+                        "schema": {
+                            "type": "object"
+                        }
+                    }
+                }
+            }
+        },
+        "/v1/models/{model}": {
+            "get": {
+                "description": "Retrieve model details by model ID (including slash-prefixed IDs)",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Models"
+                ],
+                "summary": "Get model details",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Model ID or pattern",
+                        "name": "model",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Model details",
+                        "schema": {
+                            "type": "object"
+                        }
+                    },
+                    "404": {
+                        "description": "Model not found"
+                    }
+                }
+            }
         }
     },
     "definitions": {

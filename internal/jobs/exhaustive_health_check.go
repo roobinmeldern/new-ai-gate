@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/skadraneshghn/clever-ai-gate/internal/credentials"
 	"go.uber.org/zap"
 )
 
@@ -23,15 +24,17 @@ import (
 //   - Real-time SSE events broadcast via the broadcaster channel
 type ExhaustiveHealthCheckJob struct {
 	db          *pgxpool.Pool
+	vault       *credentials.Vault
 	logger      *zap.Logger
 	broadcaster chan<- HealthCheckSSEEvent
 }
 
 // NewExhaustiveHealthCheckJob creates a new exhaustive health check job.
 // broadcaster is a send-only channel; nil disables SSE broadcasting (safe for tests).
-func NewExhaustiveHealthCheckJob(db *pgxpool.Pool, logger *zap.Logger, broadcaster chan<- HealthCheckSSEEvent) *ExhaustiveHealthCheckJob {
+func NewExhaustiveHealthCheckJob(db *pgxpool.Pool, vault *credentials.Vault, logger *zap.Logger, broadcaster chan<- HealthCheckSSEEvent) *ExhaustiveHealthCheckJob {
 	return &ExhaustiveHealthCheckJob{
 		db:          db,
+		vault:       vault,
 		logger:      logger,
 		broadcaster: broadcaster,
 	}
@@ -228,10 +231,9 @@ func (j *ExhaustiveHealthCheckJob) buildProbeMatrix(ctx context.Context) ([]prob
 			c.encrypted_key AS encrypted_key,
 			c.id            AS credential_id
 		FROM model_pools p
-		JOIN pool_credentials pc ON pc.pool_id = p.id
-		JOIN credentials c       ON c.id = pc.credential_id
+		JOIN credentials c ON c.pool_id = p.id
 		WHERE p.is_active = true
-		  AND c.is_active = true
+		  AND c.is_healthy = true
 		ORDER BY p.id, c.id
 	`)
 	if err != nil {
@@ -253,7 +255,20 @@ func (j *ExhaustiveHealthCheckJob) buildProbeMatrix(ctx context.Context) ([]prob
 			continue
 		}
 
-		t.apiKey = encryptedKey
+		var apiKey string
+		if j.vault != nil {
+			decrypted, decErr := j.vault.Decrypt(encryptedKey)
+			if decErr != nil {
+				j.logger.Warn("buildProbeMatrix: key decryption failed (skipping row)",
+					zap.Int64("credential_id", t.credentialID), zap.Error(decErr))
+				continue
+			}
+			apiKey = decrypted
+		} else {
+			apiKey = encryptedKey
+		}
+
+		t.apiKey = apiKey
 		seenPools[t.poolID] = struct{}{}
 		tasks = append(tasks, t)
 	}

@@ -109,11 +109,11 @@ func TestFindExactModelFallbacks(t *testing.T) {
 	}, nil)
 
 	allPools := map[string]*credentials.BalancedChannelPool{
-		"nvidia/meta/llama-3.3-70b-instruct":          nvidiaPool,
+		"nvidia/meta/llama-3.3-70b-instruct":           nvidiaPool,
 		"openrouter/meta-llama/llama-3.3-70b-instruct": openrouterPool,
 		"cloudflare/@cf/meta/llama-3.3-70b-instruct":   cloudflarePool,
 		"openrouter/meta-llama/llama-3.1-70b-instruct": differentVersionPool,
-		"puter/gpt-4o-mini":                           cheaperModelPool,
+		"puter/gpt-4o-mini":                            cheaperModelPool,
 	}
 
 	triedPools := map[string]bool{
@@ -175,3 +175,53 @@ func TestFormatUpstreamModelForPattern(t *testing.T) {
 		}
 	}
 }
+
+func TestFindExactModelFallbacks_PrioritySorting(t *testing.T) {
+	routeraiPool := credentials.NewBalancedPool("routerai/claude-opus-5-5", "round-robin", []*credentials.RuntimeCredential{
+		{ID: 10, APIKey: "ra-1", Provider: "routerai", BaseURL: "https://api.router.ai/v1"},
+	}, nil)
+	trueSotaPool := credentials.NewBalancedPool("true-sota/claude-opus-5.5", "round-robin", []*credentials.RuntimeCredential{
+		{ID: 20, APIKey: "ts-1", Provider: "true-sota", BaseURL: "https://true-sota.com/v1"},
+	}, nil)
+	tokenRouterPool := credentials.NewBalancedPool("tokenrouter/anthropic/claude-opus-5.5", "round-robin", []*credentials.RuntimeCredential{
+		{ID: 30, APIKey: "tr-1", Provider: "tokenrouter", BaseURL: "https://tokenrouter.ai/v1"},
+	}, nil)
+	puterPool := credentials.NewBalancedPool("puter/claude-opus-5.5", "round-robin", []*credentials.RuntimeCredential{
+		{ID: 40, APIKey: "put-1", Provider: "puter", BaseURL: "https://api.puter.com"},
+	}, nil)
+	cleanapisPool := credentials.NewBalancedPool("cleanapis/claude-opus-5.5", "round-robin", []*credentials.RuntimeCredential{
+		{ID: 50, APIKey: "ca-1", Provider: "cleanapis", BaseURL: "https://cleanapis.com/v1"},
+	}, nil)
+
+	allPools := map[string]*credentials.BalancedChannelPool{
+		"routerai/claude-opus-5-5":              routeraiPool,
+		"true-sota/claude-opus-5.5":             trueSotaPool,
+		"tokenrouter/anthropic/claude-opus-5.5": tokenRouterPool,
+		"puter/claude-opus-5.5":                 puterPool,
+		"cleanapis/claude-opus-5.5":             cleanapisPool,
+	}
+
+	tried := map[string]bool{
+		"cleanapis/claude-opus-5.5": true,
+	}
+
+	fallbacks := FindExactModelFallbacks("cleanapis/claude-opus-5.5", tried, allPools)
+	if len(fallbacks) != 4 {
+		t.Fatalf("expected 4 fallbacks, got %d", len(fallbacks))
+	}
+
+	// routerai (100) must be first, followed by true-sota (95), tokenrouter (90), and puter (-50) last
+	if fallbacks[0].ModelPattern != "routerai/claude-opus-5-5" {
+		t.Errorf("expected routerai first, got %s", fallbacks[0].ModelPattern)
+	}
+	if fallbacks[1].ModelPattern != "true-sota/claude-opus-5.5" {
+		t.Errorf("expected true-sota second, got %s", fallbacks[1].ModelPattern)
+	}
+	if fallbacks[2].ModelPattern != "tokenrouter/anthropic/claude-opus-5.5" {
+		t.Errorf("expected tokenrouter third, got %s", fallbacks[2].ModelPattern)
+	}
+	if fallbacks[3].ModelPattern != "puter/claude-opus-5.5" {
+		t.Errorf("expected puter last, got %s", fallbacks[3].ModelPattern)
+	}
+}
+

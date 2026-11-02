@@ -473,7 +473,7 @@ func normalizeGeminiModel(model string) string {
 		// 2.5 generation
 		"gemini-2.5-pro": true, "gemini-2.5-flash": true, "gemini-2.5-flash-lite": true,
 		"gemini-2.5-computer-use-preview-10-2025": true,
-		"gemini-2.5-flash-image": true, "gemini-2.5-flash-preview-tts": true,
+		"gemini-2.5-flash-image":                  true, "gemini-2.5-flash-preview-tts": true,
 		"gemini-2.5-pro-preview-tts": true,
 		// 2.0 generation
 		"gemini-2.0-flash": true, "gemini-2.0-flash-001": true,
@@ -481,13 +481,13 @@ func normalizeGeminiModel(model string) string {
 		"gemini-2.0-flash-exp": true, "gemini-2.0-flash-thinking-exp-1219": true,
 		"gemini-2.0-pro-exp-02-05": true,
 		// 3.x generation (newly discovered real models)
-		"gemini-3.5-flash": true,
+		"gemini-3.5-flash":       true,
 		"gemini-3.1-flash-image": true, "gemini-3.1-flash-image-preview": true,
 		"gemini-3.1-flash-lite": true, "gemini-3.1-flash-lite-image": true,
 		"gemini-3.1-flash-lite-preview": true, "gemini-3.1-flash-tts-preview": true,
 		"gemini-3.1-pro-preview": true, "gemini-3.1-pro-preview-customtools": true,
 		"gemini-3-flash-preview": true,
-		"gemini-3-pro-image": true, "gemini-3-pro-image-preview": true, "gemini-3-pro-preview": true,
+		"gemini-3-pro-image":     true, "gemini-3-pro-image-preview": true, "gemini-3-pro-preview": true,
 		// 1.5 generation
 		"gemini-1.5-pro": true, "gemini-1.5-flash": true,
 		// Embeddings
@@ -614,7 +614,6 @@ func stripSchemaKeywords(n *any) bool {
 	}
 	return false
 }
-
 
 // extractTextContent extracts plain text from an OpenAI message content field
 // that may be a plain string or an array of content parts.

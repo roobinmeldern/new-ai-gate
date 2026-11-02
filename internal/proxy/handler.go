@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -103,6 +104,22 @@ type proxyContext struct {
 	credential     *credentials.AcquireResult
 	pool           *credentials.BalancedChannelPool
 	tenantID       string
+
+	// Anthropic front door state (Phase 2). anthropicFront is set when the
+	// request entered through /v1/messages, which changes two things:
+	//   - the client expects Anthropic-shaped errors and responses;
+	//   - native Anthropic-protocol credentials (anthropic/agentrouter) can
+	//     receive the request with zero translation.
+	anthropicFront       bool   // request came in through the Anthropic front door
+	anthropicRawBody     []byte // original Anthropic body (input to native prep)
+	anthropicTranslated  []byte // cached canonical OpenAI body for non-native providers (nil until needed)
+	anthropicInputTokens int    // estimated input tokens for stream encoder and response translation
+	promptText           string // pre-extracted prompt text for telemetry ("" = extract lazily)
+
+	// Parallel hedging execution fields:
+	coordinator    *parallelCoordinator
+	workerIndex    int
+	requestContext context.Context
 }
 
 // Handle processes incoming AI requests on the hot-path.
@@ -134,13 +151,32 @@ func (h *Handler) Handle(c *gin.Context) {
 		h.bufPool.Put(buf)
 	}()
 
+	// Anthropic Messages API front door: requests to /v1/messages or
+	// /v1/messages/count_tokens are served by the Anthropic-compatible front
+	// API (anthropic_front.go). Every other path continues through the
+	// OpenAI-compatible pipeline below, completely untouched.
+	anthropicFront := isAnthropicFrontPath(c.Request.URL.Path)
+
 	if _, err := io.Copy(buf, c.Request.Body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read request body"})
+		if anthropicFront {
+			AnthropicErrorResponse(c, http.StatusBadRequest, "invalid_request_error", "failed to read request body")
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read request body"})
+		}
 		return
 	}
 	body := buf.Bytes()
 	rawBodyCopy := make([]byte, len(body))
 	copy(rawBodyCopy, body)
+
+	if anthropicFront {
+		if strings.HasSuffix(c.Request.URL.Path, "count_tokens") {
+			h.handleAnthropicCountTokens(c, rawBodyCopy)
+		} else {
+			h.handleAnthropicMessages(c, rawBodyCopy)
+		}
+		return
+	}
 
 	// Step 2: Extract the "model" field for routing.
 	//
@@ -573,13 +609,13 @@ func (h *Handler) Handle(c *gin.Context) {
 	}
 
 	// Try every credential in the pool before giving up.
-	// Cap at 20 to avoid runaway loops on huge pools.
+	// Cap at 100 to avoid runaway loops on huge pools.
 	maxAttempts := int(pool.TotalCount)
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
-	if maxAttempts > 20 {
-		maxAttempts = 20
+	if maxAttempts > 100 {
+		maxAttempts = 100
 	}
 	h.executeWithRetry(c, pctx, requestStart, maxAttempts)
 }
@@ -592,6 +628,59 @@ type attemptRecord struct {
 	statusCode   int
 	credID       int
 	transient400 bool // 400 was an upstream-side failure, not a payload schema error
+}
+
+// parallelCoordinator synchronizes multiple parallel key evaluation goroutines.
+// It guarantees that at most one worker claims victory and writes to the client connection,
+// while canceling non-winning workers.
+type parallelCoordinator struct {
+	winnerOnce  sync.Once
+	winnerIndex int
+	hasWinner   atomic.Bool
+	cancelFuncs []context.CancelFunc
+	cancelMu    sync.Mutex
+}
+
+func (pc *parallelCoordinator) cancelOthers(winnerIdx int) {
+	pc.cancelMu.Lock()
+	defer pc.cancelMu.Unlock()
+	for i, cancel := range pc.cancelFuncs {
+		if i != winnerIdx && cancel != nil {
+			cancel()
+		}
+	}
+}
+
+func (pc *parallelCoordinator) cancelAll() {
+	pc.cancelMu.Lock()
+	defer pc.cancelMu.Unlock()
+	for _, cancel := range pc.cancelFuncs {
+		if cancel != nil {
+			cancel()
+		}
+	}
+}
+
+func (pc *parallelCoordinator) claimVictory(idx int) bool {
+	won := false
+	pc.winnerOnce.Do(func() {
+		pc.winnerIndex = idx
+		pc.hasWinner.Store(true)
+		won = true
+	})
+	if won {
+		pc.cancelOthers(idx)
+	}
+	return won
+}
+
+type workerResult struct {
+	workerIndex int
+	result      *credentials.AcquireResult
+	statusCode  int
+	upstreamURL string
+	errBody     []byte
+	err         error
 }
 
 // retryRoundsPerPool is the number of complete passes over a pool's
@@ -656,29 +745,265 @@ func poolSoonestCooldownRemaining(pool *credentials.BalancedChannelPool) time.Du
 	return remaining
 }
 
-// executeWithRetry attempts the proxy request, cycling through ALL credentials
-// in the pool before giving up.
-//
-// Total exhaustion policy — ANY non-2xx response or transport error rotates
-// to the next available key. The loop never aborts early for a single error:
-//   - 400/401/402/403/404/422: key rejected or wrong tier — long cooldown, rotate.
-//   - 429 single-key pool: abort immediately (no other key can help).
-//   - 429 multi-key pool: short cooldown, rotate to next key.
-//   - 5xx / transport-mapped (502/504) / non-standard codes: moderate cooldown, rotate.
-//
-// Retry-round policy — the gateway does NOT switch providers on the first
-// full failure of a pool. After every credential has failed once, ALL
-// credentials are retried in complete rounds (up to retryRoundsPerPool), so
-// transient upstream errors recover without a provider switch. Rounds are
-// skipped when the last round produced only non-retryable credential
-// rejections, and each round waits at most roundTransitionWaitBudget for
-// cooled-down keys.
-//
-// Only after all retry rounds fail does the exact-model cross-provider
-// fallback switch to another provider hosting the exact same model. If every
-// such provider is exhausted, a canonical OpenAI error envelope describing
-// every pool, every round, and every credential attempt is returned to the
-// client.
+// parallelBatchSize is the number of provider keys evaluated concurrently in each wave.
+const parallelBatchSize = 5
+
+func (h *Handler) emitSuccessTelemetry(
+	c *gin.Context,
+	pctx *proxyContext,
+	result *credentials.AcquireResult,
+	statusCode int,
+	upstreamURL string,
+	body []byte,
+	requestStart time.Time,
+	triedCount int,
+) {
+	atomic.StoreUint32(&result.Credential.ConsecutiveFailures, 0)
+	result.FromPool.ResetCooldown(result.Index)
+	h.logger.Info("proxy request completed",
+		zap.String("model", pctx.model),
+		zap.String("provider", result.Credential.Provider),
+		zap.String("upstream_url", upstreamURL),
+		zap.String("tenant_id", pctx.tenantID),
+		zap.Bool("stream", pctx.isStream),
+		zap.Int("status", statusCode),
+		zap.Int("unique_tried", triedCount),
+		zap.Duration("elapsed", time.Since(requestStart)),
+	)
+
+	if h.pipeline == nil {
+		return
+	}
+
+	promptText := pctx.promptText
+	if promptText == "" {
+		promptText = extractPromptText(pctx.body)
+	}
+	var responseText string
+	var completionTokens int
+	var promptTokens int
+
+	if pctx.isStream && statusCode == http.StatusOK {
+		responseText, _ = jsonparser.GetString(body, "text")
+		if tok, err := jsonparser.GetInt(body, "tokens"); err == nil {
+			completionTokens = int(tok)
+		}
+	} else {
+		responseText = extractResponseText(body)
+		completionTokens = extractTokens(body, "completion")
+	}
+
+	promptTokens = extractTokens(pctx.body, "prompt")
+	if promptTokens == 0 {
+		if pctx.anthropicInputTokens > 0 {
+			promptTokens = pctx.anthropicInputTokens
+		} else {
+			promptTokens = len(promptText) / 4
+		}
+	}
+	if completionTokens == 0 && responseText != "" {
+		completionTokens = len(responseText) / 4
+	}
+
+	entry := telemetry.AcquireEntry()
+	entry.TenantID = pctx.tenantID
+	entry.Model = pctx.model
+	entry.Provider = result.Credential.Provider
+	entry.PromptTokens = promptTokens
+	entry.CompletionTokens = completionTokens
+	entry.LatencyMs = int(time.Since(requestStart).Milliseconds())
+	entry.StatusCode = statusCode
+	entry.CreatedAt = time.Now()
+	entry.Prompt = promptText
+	entry.Response = responseText
+	h.pipeline.Emit(entry)
+}
+
+func (h *Handler) handleCredentialFailure(
+	ctx context.Context,
+	pctx *proxyContext,
+	result *credentials.AcquireResult,
+	statusCode int,
+	upstreamURL string,
+	errBody []byte,
+	err error,
+	attempts *[]attemptRecord,
+	requestID any,
+	triedCount int,
+	maxAttempts int,
+	requestStart time.Time,
+	strippedSamplingParams map[string]bool,
+) (recStatus int, isFastFail404 bool, isFastFail400 bool) {
+	recStatus = statusCode
+	if err != nil {
+		recStatus = http.StatusInternalServerError
+	}
+	*attempts = append(*attempts, attemptRecord{
+		provider:     result.Credential.Provider,
+		statusCode:   recStatus,
+		credID:       result.Credential.ID,
+		transient400: recStatus == http.StatusBadRequest && isTransientUpstream400(errBody),
+	})
+
+	atomic.AddUint32(&result.Credential.ConsecutiveFailures, 1)
+
+	if h.AlertManager != nil {
+		errStr := "request failed"
+		if err != nil {
+			errStr = err.Error()
+		} else if len(errBody) > 0 {
+			if len(errBody) > 100 {
+				errStr = string(errBody[:100]) + "..."
+			} else {
+				errStr = string(errBody)
+			}
+		}
+		_ = h.AlertManager.TrackFailover(ctx, result.Credential.ID, pctx.model, errStr)
+	}
+
+	cooldownDuration := cooldownForStatus(recStatus)
+
+	isDepletedAccount := false
+	if recStatus == http.StatusPaymentRequired {
+		isDepletedAccount = true
+	} else if len(errBody) > 0 {
+		bodyLower := strings.ToLower(string(errBody))
+		if strings.Contains(bodyLower, "not_enough_balance") ||
+			strings.Contains(bodyLower, "insufficient_balance") ||
+			strings.Contains(bodyLower, "insufficient_funds") ||
+			strings.Contains(bodyLower, "account suspended") ||
+			strings.Contains(bodyLower, "account_suspended") ||
+			strings.Contains(bodyLower, "quota_exceeded") ||
+			strings.Contains(bodyLower, "credit limit") ||
+			strings.Contains(bodyLower, "usage-limited-chat") ||
+			strings.Contains(bodyLower, "error_400_from_delegate") ||
+			strings.Contains(bodyLower, "not enough credits") ||
+			strings.Contains(bodyLower, "insufficient credits") ||
+			strings.Contains(bodyLower, "insufficient_quota") ||
+			strings.Contains(bodyLower, "insufficient_credits") ||
+			strings.Contains(bodyLower, "agent_low_balance") ||
+			strings.Contains(bodyLower, "enter.pollinations.ai") ||
+			strings.Contains(bodyLower, "upstream_error_in_success_body") {
+			isDepletedAccount = true
+		}
+	}
+
+	isSingleKey := pctx.pool != nil && pctx.pool.TotalCount == 1
+
+	if isCloudflareModelAgreementError(errBody) {
+		cooldownDuration = 1 * time.Second
+		isDepletedAccount = false
+		accountID := strings.TrimPrefix(result.Credential.BaseURL, "cloudflare:")
+		_ = autoAcceptCloudflareModelAgreement(ctx, h.client, accountID, result.Credential.APIKey, pctx.model)
+	} else if isDepletedAccount {
+		if isSingleKey {
+			cooldownDuration = 15 * time.Second
+		} else {
+			cooldownDuration = 30 * time.Minute
+		}
+		h.logger.Warn("credential account balance exhausted or rate limited — applying cooldown",
+			zap.String("model", pctx.model),
+			zap.String("provider", result.Credential.Provider),
+			zap.Int("credential_id", result.Credential.ID),
+			zap.Duration("cooldown", cooldownDuration),
+			zap.ByteString("error_body", errBody),
+		)
+	} else if result.Credential.Provider == "puter" {
+		isQuotaError := recStatus == http.StatusPaymentRequired ||
+			recStatus == http.StatusForbidden ||
+			recStatus == http.StatusTooManyRequests
+		if isQuotaError {
+			if isSingleKey {
+				cooldownDuration = 15 * time.Second
+			} else {
+				cooldownDuration = 30 * time.Minute
+			}
+		}
+	}
+
+	isPuterQuota400 := false
+	if result.Credential.Provider == "puter" && recStatus == http.StatusBadRequest && len(errBody) > 0 {
+		bodyStr := string(errBody)
+		if strings.Contains(bodyStr, "usage-limited-chat") ||
+			strings.Contains(bodyStr, "insufficient_funds") ||
+			strings.Contains(bodyStr, "error_400_from_delegate") ||
+			strings.Contains(bodyStr, "Permission denied") {
+			isPuterQuota400 = true
+		}
+	}
+
+	if isSingleKey && cooldownDuration > 15*time.Second {
+		cooldownDuration = 15 * time.Second
+	}
+
+	if isCredentialAuthError(recStatus) || isPuterQuota400 || isDepletedAccount {
+		result.FromPool.PenalizeToken(result.Index, cooldownDuration)
+		h.broadcaster.PublishPenalize(result.FromPool.ModelPattern, result.Credential.ID, result.Index, time.Now().Add(cooldownDuration))
+		h.logger.Warn("credential rejected by upstream (quota/auth/balance limit) — rotating key",
+			zap.String("request_id", fmt.Sprintf("%v", requestID)),
+			zap.String("model", pctx.model),
+			zap.String("provider", result.Credential.Provider),
+			zap.String("upstream_url", upstreamURL),
+			zap.Int("status", recStatus),
+			zap.Int("credential_id", result.Credential.ID),
+			zap.Int("keys_tried", triedCount),
+			zap.Duration("cooldown", cooldownDuration),
+		)
+		return recStatus, false, false
+	}
+
+	if recStatus == http.StatusNotFound {
+		h.logger.Warn("upstream returned 404 not found — aborting retry loop to protect pool keys",
+			zap.String("model", pctx.model),
+			zap.String("provider", result.Credential.Provider),
+			zap.ByteString("error_body", errBody),
+		)
+		return recStatus, true, false
+	}
+
+	if recStatus == http.StatusBadRequest {
+		provider400Count := 0
+		for _, a := range *attempts {
+			if a.provider == result.Credential.Provider && a.statusCode == http.StatusBadRequest && !a.transient400 {
+				provider400Count++
+			}
+		}
+		if provider400Count >= 2 && !isTransientUpstream400(errBody) {
+			h.logger.Error("payload schema error — aborting rotation to protect remaining pool keys",
+				zap.String("model", pctx.model),
+				zap.String("provider", result.Credential.Provider),
+				zap.Int("status", recStatus),
+				zap.Int("provider_400_count", provider400Count),
+				zap.ByteString("error_body", errBody),
+			)
+			return recStatus, false, true
+		}
+	}
+
+	if isSingleKey {
+		cooldownDuration = 300 * time.Millisecond
+	}
+	result.FromPool.PenalizeToken(result.Index, cooldownDuration)
+	h.broadcaster.PublishPenalize(result.FromPool.ModelPattern, result.Credential.ID, result.Index, time.Now().Add(cooldownDuration))
+	h.logger.Warn("upstream request failed — rotating to next key",
+		zap.String("request_id", fmt.Sprintf("%v", requestID)),
+		zap.String("model", pctx.model),
+		zap.String("provider", result.Credential.Provider),
+		zap.String("upstream_url", upstreamURL),
+		zap.String("tenant_id", pctx.tenantID),
+		zap.Int("status", recStatus),
+		zap.Int("max_attempts", maxAttempts),
+		zap.Int("keys_tried", triedCount),
+		zap.Duration("cooldown", cooldownDuration),
+		zap.Duration("elapsed", time.Since(requestStart)),
+		zap.NamedError("transport_err", err),
+	)
+
+	return recStatus, false, false
+}
+
+// executeWithRetry attempts the proxy request, evaluating provider credentials
+// in parallel waves before falling back to another provider hosting the exact same model.
 func (h *Handler) executeWithRetry(c *gin.Context, pctx *proxyContext, requestStart time.Time, maxAttempts int) {
 	requestID, _ := c.Get("request_id")
 	var lastErrBody []byte
@@ -697,8 +1022,6 @@ func (h *Handler) executeWithRetry(c *gin.Context, pctx *proxyContext, requestSt
 	}
 
 	// Retry-round + cross-provider fallback bookkeeping.
-	// round counts complete passes over the CURRENT pool's credentials:
-	// 1 = initial pass, retryRoundsPerPool = last allowed pass.
 	round := 1
 	roundStartIdx := 0 // index into attempts where the current round began
 	poolsAttempted := make([]string, 0, 2)
@@ -707,21 +1030,11 @@ func (h *Handler) executeWithRetry(c *gin.Context, pctx *proxyContext, requestSt
 		poolsAttempted = append(poolsAttempted, pctx.pool.ModelPattern)
 	}
 
-	// Safety valve: in a high-concurrency surge, AcquireActiveToken may return
-	// the same index multiple times as the atomic cursor races with other requests.
-	// The triedIndices guard correctly fires a continue, but with a fixed attempt
-	// counter that continue would burn a slot without evaluating a new key — causing
-	// premature pool exhaustion errors.
-	//
-	// Fix: loop on triedCount (unique keys tried) not attempt (total iterations).
-	// Safety valve maxSpins prevents an infinite spin if all remaining untried keys
-	// are penalized by concurrent requests between our iterations.
 	maxSpins := maxAttempts*3 + 1
 	spins := 0
 
 retryLoop:
 	for triedCount < maxAttempts {
-		// Stop immediately if the client context was canceled or timed out
 		if c.Request.Context().Err() != nil {
 			h.logger.Warn("client context canceled or timed out — aborting retry loop immediately to protect pool credentials",
 				zap.String("model", pctx.model),
@@ -730,21 +1043,23 @@ retryLoop:
 				zap.Error(c.Request.Context().Err()),
 			)
 			if !c.Writer.Written() {
-				c.AbortWithStatusJSON(http.StatusGatewayTimeout, gin.H{
-					"error": gin.H{
-						"message": "Client request timed out or was canceled",
-						"type":    "timeout_error",
-						"code":    "context_canceled",
-					},
-				})
+				if pctx.anthropicFront {
+					AnthropicErrorResponse(c, http.StatusGatewayTimeout, "api_error", "Client request timed out or was canceled")
+				} else {
+					c.AbortWithStatusJSON(http.StatusGatewayTimeout, gin.H{
+						"error": gin.H{
+							"message": "Client request timed out or was canceled",
+							"type":    "timeout_error",
+							"code":    "context_canceled",
+						},
+					})
+				}
 			}
 			return
 		}
 
 		spins++
 		if spins > maxSpins {
-			// All remaining pool tokens were penalized by concurrent requests
-			// before we could acquire them. Exit gracefully.
 			h.logger.Warn("retry loop safety valve — all remaining tokens penalized by concurrent requests",
 				zap.String("model", pctx.model),
 				zap.String("tenant_id", pctx.tenantID),
@@ -755,14 +1070,15 @@ retryLoop:
 			break retryLoop
 		}
 
-		// Lock-free credential acquisition
-		result := pctx.pool.AcquireActiveToken()
+		batch := pctx.pool.AcquireBatchActiveTokens(parallelBatchSize, triedIndices)
+		if len(batch) == 0 {
+			allTried := pctx.pool != nil && len(triedIndices) >= int(pctx.pool.TotalCount)
+			if allTried {
+				break retryLoop
+			}
 
-		if result == nil {
-			// All tokens are currently on cooldown.
-			// Pick the soonest-available one and decide whether waiting is worthwhile.
-			result = pctx.pool.AcquireLeastPenalizedToken()
-			if result == nil {
+			soonest := pctx.pool.AcquireLeastPenalizedToken()
+			if soonest == nil {
 				h.logger.Error("no credentials in pool at all",
 					zap.String("model", pctx.model),
 					zap.String("tenant_id", pctx.tenantID),
@@ -773,24 +1089,14 @@ retryLoop:
 				return
 			}
 			now := time.Now().UnixNano()
-			cooldownUntil := atomic.LoadInt64(&result.Credential.CooldownUntil)
+			cooldownUntil := atomic.LoadInt64(&soonest.Credential.CooldownUntil)
 			if cooldownUntil > now {
 				sleepFor := time.Duration(cooldownUntil - now)
-				// Fast-fail: a fresh request (round 1) against a pool whose
-				// soonest credential needs more than cooldownAcquireWaitBudget
-				// is staring at a hard rejection (suspended account, exhausted
-				// quota, rate-limit window). Sleeping 600ms per key and probing
-				// anyway — the historical behavior — multiplied a 17-key dead
-				// pool into ~15s of doomed requests before a 502. Skip the
-				// wait entirely and fail over to the exact-model fallback or a
-				// meaningful exhaustion error. Retry rounds 2+ intentionally
-				// keep the sleep-and-probe behavior: they re-probe cooldowns
-				// created by this request's own transient failures.
 				if round == 1 && sleepFor > cooldownAcquireWaitBudget {
 					h.logger.Warn("all pool credentials cooling down for longer than the acquire wait budget — skipping cooldown wait and failing over",
 						zap.String("model", pctx.model),
 						zap.String("tenant_id", pctx.tenantID),
-						zap.String("provider", result.Credential.Provider),
+						zap.String("provider", soonest.Credential.Provider),
 						zap.Duration("soonest_cooldown_remaining", sleepFor),
 						zap.Int("unique_tried", triedCount),
 					)
@@ -802,360 +1108,258 @@ retryLoop:
 				}
 				h.logger.Warn("all tokens cooling down; sleeping until soonest is ready",
 					zap.String("model", pctx.model),
-					zap.String("provider", result.Credential.Provider),
+					zap.String("provider", soonest.Credential.Provider),
 					zap.Duration("sleep", sleepFor),
 					zap.Int("unique_tried", triedCount),
 				)
 				time.Sleep(sleepFor)
 			}
+			continue retryLoop
 		}
 
-		// Check if the credential is rate-limited in Redis before scheduling request (Gemini only)
-		if result.Credential.Provider == "gemini" {
-			if h.isKeyRateLimitedInRedis(c.Request.Context(), result.Credential) {
-				// Local 5-second cooldown to let other concurrent requests cycle to other keys
-				result.FromPool.PenalizeToken(result.Index, 5*time.Second)
-				continue
+		// Single-key synchronous path (zero goroutine/coordination overhead)
+		if len(batch) == 1 {
+			result := batch[0]
+			triedIndices[result.Index] = true
+			triedCount++
+			pctx.credential = result
+			pctx.coordinator = nil
+			pctx.workerIndex = 0
+			pctx.requestContext = nil
+
+			if result.Credential.Provider == "gemini" {
+				if h.isKeyRateLimitedInRedis(c.Request.Context(), result.Credential) {
+					result.FromPool.PenalizeToken(result.Index, 5*time.Second)
+					continue retryLoop
+				}
+				h.incrementRedisRPM(c.Request.Context(), result.Credential)
 			}
-		}
 
-		// Skip credentials we've already tried in this request
-		if triedIndices[result.Index] {
-			continue
-		}
-		triedIndices[result.Index] = true
-		triedCount++
-		pctx.credential = result
-
-		// Increment Redis RPM count if it's Gemini
-		if result.Credential.Provider == "gemini" {
-			h.incrementRedisRPM(c.Request.Context(), result.Credential)
-		}
-
-		h.logger.Info("attempting request with credential",
-			zap.String("request_id", fmt.Sprintf("%v", requestID)),
-			zap.String("model", pctx.model),
-			zap.String("provider", result.Credential.Provider),
-			zap.String("studio_provider", pctx.studioProvider),
-			zap.Int("credential_id", result.Credential.ID),
-			zap.Int("round", round),
-			zap.Int("attempt", triedCount),
-			zap.Int("max_attempts", maxAttempts),
-			zap.Int("max_rounds", retryRoundsPerPool),
-		)
-
-		statusCode, upstreamURL, errBody, err := h.forwardRequest(c, pctx)
-
-		// If client disconnected or timed out during forwardRequest, exit immediately
-		if c.Request.Context().Err() != nil {
-			h.logger.Warn("request terminated due to client context cancellation — aborting rotation without penalizing remaining keys",
+			h.logger.Info("attempting request with credential",
+				zap.String("request_id", fmt.Sprintf("%v", requestID)),
 				zap.String("model", pctx.model),
 				zap.String("provider", result.Credential.Provider),
 				zap.Int("credential_id", result.Credential.ID),
-				zap.Int("keys_tried", triedCount),
+				zap.Int("round", round),
+				zap.Int("attempt", triedCount),
+				zap.Int("max_attempts", maxAttempts),
+			)
+
+			statusCode, upstreamURL, errBody, err := h.forwardRequest(c, pctx)
+			if c.Request.Context().Err() != nil {
+				h.logger.Warn("request terminated due to client context cancellation — aborting rotation",
+					zap.String("model", pctx.model),
+					zap.String("provider", result.Credential.Provider),
+					zap.Int("credential_id", result.Credential.ID),
+					zap.Error(c.Request.Context().Err()),
+				)
+				if !c.Writer.Written() {
+					if pctx.anthropicFront {
+						AnthropicErrorResponse(c, http.StatusGatewayTimeout, "api_error", "Client request timed out or was canceled")
+					} else {
+						c.AbortWithStatusJSON(http.StatusGatewayTimeout, gin.H{
+							"error": gin.H{
+								"message": "Client request timed out or was canceled",
+								"type":    "timeout_error",
+								"code":    "context_canceled",
+							},
+						})
+					}
+				}
+				return
+			}
+
+			if err == nil && statusCode >= 200 && statusCode < 300 {
+				h.emitSuccessTelemetry(c, pctx, result, statusCode, upstreamURL, errBody, requestStart, triedCount)
+				return
+			}
+
+			if statusCode == http.StatusBadRequest {
+				if param, ok := parseUnsupportedSamplingParam(errBody); ok && !strippedSamplingParams[param] {
+					if stripped, changed := stripJSONTopLevelKeys(pctx.body, []string{param}); changed {
+						strippedSamplingParams[param] = true
+						pctx.body = stripped
+						delete(triedIndices, result.Index)
+						triedCount--
+						h.logger.Warn("upstream rejected unsupported sampling parameter — stripped it and retrying same credential",
+							zap.String("model", pctx.model),
+							zap.String("provider", result.Credential.Provider),
+							zap.Int("credential_id", result.Credential.ID),
+							zap.String("param", param),
+						)
+						continue retryLoop
+					}
+				}
+			}
+
+			recStatus, fastFail404, fastFail400 := h.handleCredentialFailure(
+				c.Request.Context(), pctx, result, statusCode, upstreamURL, errBody, err,
+				&attempts, requestID, triedCount, maxAttempts, requestStart, strippedSamplingParams,
+			)
+			lastErrBody = errBody
+			lastStatus = recStatus
+			lastProvider = result.Credential.Provider
+
+			if fastFail404 || fastFail400 {
+				break retryLoop
+			}
+			if recStatus == http.StatusTooManyRequests && pctx.pool != nil && pctx.pool.TotalCount == 1 {
+				break retryLoop
+			}
+			continue retryLoop
+		}
+
+		// Multi-key parallel hedged execution path (waves of up to parallelBatchSize)
+		for _, cand := range batch {
+			triedIndices[cand.Index] = true
+		}
+		triedCount += len(batch)
+
+		coord := &parallelCoordinator{
+			cancelFuncs: make([]context.CancelFunc, len(batch)),
+		}
+		resCh := make(chan workerResult, len(batch))
+
+		for i := 0; i < len(batch); i++ {
+			cand := batch[i]
+			workerCtx, cancel := context.WithCancel(c.Request.Context())
+			coord.cancelFuncs[i] = cancel
+
+			if cand.Credential.Provider == "gemini" {
+				if h.isKeyRateLimitedInRedis(c.Request.Context(), cand.Credential) {
+					cand.FromPool.PenalizeToken(cand.Index, 5*time.Second)
+					cancel()
+					resCh <- workerResult{
+						workerIndex: i,
+						result:      cand,
+						statusCode:  http.StatusTooManyRequests,
+						err:         errors.New("redis rpm limit exceeded"),
+					}
+					continue
+				}
+				h.incrementRedisRPM(c.Request.Context(), cand.Credential)
+			}
+
+			h.logger.Info("attempting parallel request with credential",
+				zap.String("request_id", fmt.Sprintf("%v", requestID)),
+				zap.String("model", pctx.model),
+				zap.String("provider", cand.Credential.Provider),
+				zap.Int("credential_id", cand.Credential.ID),
+				zap.Int("batch_size", len(batch)),
+				zap.Int("worker_index", i),
+				zap.Int("attempt", triedCount),
+			)
+
+			go func(workerIdx int, credRes *credentials.AcquireResult, reqCtx context.Context) {
+				workerPctx := *pctx
+				workerPctx.credential = credRes
+				workerPctx.coordinator = coord
+				workerPctx.workerIndex = workerIdx
+				workerPctx.requestContext = reqCtx
+
+				statusCode, upstreamURL, errBody, err := h.forwardRequest(c, &workerPctx)
+				resCh <- workerResult{
+					workerIndex: workerIdx,
+					result:      credRes,
+					statusCode:  statusCode,
+					upstreamURL: upstreamURL,
+					errBody:     errBody,
+					err:         err,
+				}
+			}(i, cand, workerCtx)
+		}
+
+		var winner *workerResult
+		var shouldBreakLoop bool
+		var batchResults []workerResult
+
+		for collected := 0; collected < len(batch); collected++ {
+			res := <-resCh
+
+			isCanceledLoser := (res.err == context.Canceled || errors.Is(res.err, context.Canceled)) &&
+				coord.hasWinner.Load() && coord.winnerIndex != res.workerIndex
+
+			if isCanceledLoser {
+				continue
+			}
+
+			batchResults = append(batchResults, res)
+			if res.err == nil && res.statusCode >= 200 && res.statusCode < 300 {
+				winner = &res
+			}
+		}
+
+		coord.cancelAll()
+
+		if winner == nil {
+			hasParamSelfHeal := false
+			for _, res := range batchResults {
+				if res.statusCode == http.StatusBadRequest {
+					if param, ok := parseUnsupportedSamplingParam(res.errBody); ok && !strippedSamplingParams[param] {
+						if stripped, changed := stripJSONTopLevelKeys(pctx.body, []string{param}); changed {
+							strippedSamplingParams[param] = true
+							pctx.body = stripped
+							for _, cand := range batch {
+								delete(triedIndices, cand.Index)
+							}
+							triedCount -= len(batch)
+							h.logger.Warn("upstream rejected unsupported sampling parameter — stripped it and retrying batch",
+								zap.String("model", pctx.model),
+								zap.String("param", param),
+							)
+							hasParamSelfHeal = true
+							break
+						}
+					}
+				}
+			}
+			if hasParamSelfHeal {
+				continue retryLoop
+			}
+
+			for _, res := range batchResults {
+				recStatus, fastFail404, fastFail400 := h.handleCredentialFailure(
+					c.Request.Context(), pctx, res.result, res.statusCode, res.upstreamURL, res.errBody, res.err,
+					&attempts, requestID, triedCount, maxAttempts, requestStart, strippedSamplingParams,
+				)
+				lastErrBody = res.errBody
+				lastStatus = recStatus
+				lastProvider = res.result.Credential.Provider
+				if fastFail404 || fastFail400 {
+					shouldBreakLoop = true
+				}
+			}
+		}
+
+		if c.Request.Context().Err() != nil {
+			h.logger.Warn("client context canceled or timed out during parallel batch — aborting",
+				zap.String("model", pctx.model),
 				zap.Error(c.Request.Context().Err()),
 			)
 			if !c.Writer.Written() {
-				c.AbortWithStatusJSON(http.StatusGatewayTimeout, gin.H{
-					"error": gin.H{
-						"message": "Client request timed out or was canceled",
-						"type":    "timeout_error",
-						"code":    "context_canceled",
-					},
-				})
+				if pctx.anthropicFront {
+					AnthropicErrorResponse(c, http.StatusGatewayTimeout, "api_error", "Client request timed out or was canceled")
+				} else {
+					c.AbortWithStatusJSON(http.StatusGatewayTimeout, gin.H{
+						"error": gin.H{
+							"message": "Client request timed out or was canceled",
+							"type":    "timeout_error",
+							"code":    "context_canceled",
+						},
+					})
+				}
 			}
 			return
 		}
 
-		// ── True 2xx success: forwardRequest already wrote to c.Writer ────────
-		if err == nil && statusCode >= 200 && statusCode < 300 {
-			atomic.StoreUint32(&result.Credential.ConsecutiveFailures, 0)
-			pctx.pool.ResetCooldown(result.Index)
-			h.logger.Info("proxy request completed",
-				zap.String("model", pctx.model),
-				zap.String("provider", result.Credential.Provider),
-				zap.String("upstream_url", upstreamURL),
-				zap.String("tenant_id", pctx.tenantID),
-				zap.Bool("stream", pctx.isStream),
-				zap.Int("status", statusCode),
-				zap.Int("unique_tried", triedCount),
-				zap.Duration("elapsed", time.Since(requestStart)),
-			)
-
-			// Emit success telemetry (zero-alloc pool pattern)
-			if h.pipeline != nil {
-				promptText := extractPromptText(pctx.body)
-				var responseText string
-				var completionTokens int
-				var promptTokens int
-
-				if pctx.isStream && statusCode == http.StatusOK {
-					// Use jsonparser (reflection-free, zero-alloc) instead of
-					// json.Unmarshal which uses reflect and creates heap-escaped
-					// type descriptors on every streaming request.
-					responseText, _ = jsonparser.GetString(errBody, "text")
-					if tok, err := jsonparser.GetInt(errBody, "tokens"); err == nil {
-						completionTokens = int(tok)
-					}
-				} else {
-					responseText = extractResponseText(errBody)
-					completionTokens = extractTokens(errBody, "completion")
-				}
-
-				promptTokens = extractTokens(pctx.body, "prompt")
-				if promptTokens == 0 {
-					promptTokens = len(promptText) / 4
-				}
-				if completionTokens == 0 && responseText != "" {
-					completionTokens = len(responseText) / 4
-				}
-
-				entry := telemetry.AcquireEntry()
-				entry.TenantID = pctx.tenantID
-				entry.Model = pctx.model
-				entry.Provider = result.Credential.Provider
-				entry.PromptTokens = promptTokens
-				entry.CompletionTokens = completionTokens
-				entry.LatencyMs = int(time.Since(requestStart).Milliseconds())
-				entry.StatusCode = statusCode
-				entry.CreatedAt = time.Now()
-				entry.Prompt = promptText
-				entry.Response = responseText
-				h.pipeline.Emit(entry)
-			}
+		if winner != nil {
+			h.emitSuccessTelemetry(c, pctx, winner.result, winner.statusCode, winner.upstreamURL, winner.errBody, requestStart, triedCount)
 			return
 		}
 
-		// ── Non-2xx or unrecovered panic: record, penalize, rotate ────────────
-		// forwardRequest maps ALL transport errors to numeric status codes (502/504),
-		// so err is non-nil only for recovered panics inside forwardRequest (500).
-		recStatus := statusCode
-		if err != nil {
-			recStatus = http.StatusInternalServerError
-		}
-		attempts = append(attempts, attemptRecord{
-			provider:     result.Credential.Provider,
-			statusCode:   recStatus,
-			credID:       result.Credential.ID,
-			transient400: recStatus == http.StatusBadRequest && isTransientUpstream400(errBody),
-		})
-		lastErrBody = errBody
-		lastStatus = recStatus
-		lastProvider = result.Credential.Provider
-
-		// Increment consecutive failures atomically
-		atomic.AddUint32(&result.Credential.ConsecutiveFailures, 1)
-
-		// Record rotation telemetry
-		if h.AlertManager != nil {
-			errStr := "request failed"
-			if err != nil {
-				errStr = err.Error()
-			} else if len(errBody) > 0 {
-				if len(errBody) > 100 {
-					errStr = string(errBody[:100]) + "..."
-				} else {
-					errStr = string(errBody)
-				}
-			}
-			_ = h.AlertManager.TrackFailover(c.Request.Context(), result.Credential.ID, pctx.model, errStr)
-		}
-
-		cooldownDuration := cooldownForStatus(recStatus)
-
-		// Check for Account / Balance / Quota exhaustion across all providers
-		isDepletedAccount := false
-		if len(errBody) > 0 {
-			bodyLower := strings.ToLower(string(errBody))
-			if strings.Contains(bodyLower, "not_enough_balance") ||
-				strings.Contains(bodyLower, "insufficient_balance") ||
-				strings.Contains(bodyLower, "insufficient_funds") ||
-				strings.Contains(bodyLower, "account suspended") ||
-				strings.Contains(bodyLower, "account_suspended") ||
-				strings.Contains(bodyLower, "quota_exceeded") ||
-				strings.Contains(bodyLower, "credit limit") ||
-				strings.Contains(bodyLower, "usage-limited-chat") ||
-				strings.Contains(bodyLower, "error_400_from_delegate") ||
-				// Error-in-success-body sniffer (response_error_sniffer.go):
-				// synthetic 402 bodies mark credit/balance errors that were
-				// smuggled inside 200 OK responses (e.g. Pollinations).
-				strings.Contains(bodyLower, "not enough credits") ||
-				strings.Contains(bodyLower, "insufficient credits") ||
-				strings.Contains(bodyLower, "insufficient_quota") ||
-				strings.Contains(bodyLower, "insufficient_credits") ||
-				strings.Contains(bodyLower, "agent_low_balance") ||
-				strings.Contains(bodyLower, "enter.pollinations.ai") ||
-				strings.Contains(bodyLower, "upstream_error_in_success_body") {
-				isDepletedAccount = true
-			}
-		}
-
-		if isCloudflareModelAgreementError(errBody) {
-			cooldownDuration = 1 * time.Second
-			isDepletedAccount = false
-			accountID := strings.TrimPrefix(result.Credential.BaseURL, "cloudflare:")
-			_ = autoAcceptCloudflareModelAgreement(c.Request.Context(), h.client, accountID, result.Credential.APIKey, pctx.model)
-		} else if isDepletedAccount {
-			// Transient backoff instead of 24h disabling so key is not deactivated
-			cooldownDuration = 15 * time.Second
-			h.logger.Warn("credential account balance exhausted or rate limited — applying transient 15s cooldown",
-				zap.String("model", pctx.model),
-				zap.String("provider", result.Credential.Provider),
-				zap.Int("credential_id", result.Credential.ID),
-				zap.ByteString("error_body", errBody),
-			)
-		} else if result.Credential.Provider == "puter" {
-			// Check if this is a rate limit, quota exhaust, or Puter's custom Bad Request quota signal
-			isQuotaError := recStatus == http.StatusPaymentRequired ||
-				recStatus == http.StatusForbidden ||
-				recStatus == http.StatusTooManyRequests
-
-			if isQuotaError {
-				cooldownDuration = 15 * time.Second
-			}
-		}
-
-		isSingleKey := pctx.pool.TotalCount == 1
-
-		// Check if it's a Puter-specific quota error disguised as 400
-		isPuterQuota400 := false
-		if result.Credential.Provider == "puter" && recStatus == http.StatusBadRequest && len(errBody) > 0 {
-			bodyStr := string(errBody)
-			if strings.Contains(bodyStr, "usage-limited-chat") ||
-				strings.Contains(bodyStr, "insufficient_funds") ||
-				strings.Contains(bodyStr, "error_400_from_delegate") ||
-				strings.Contains(bodyStr, "Permission denied") {
-				isPuterQuota400 = true
-			}
-		}
-
-		if isCredentialAuthError(recStatus) || isPuterQuota400 || isDepletedAccount {
-			// Quota/auth error: rotate to the next key.
-			result.FromPool.PenalizeToken(result.Index, cooldownDuration)
-			h.broadcaster.PublishPenalize(result.FromPool.ModelPattern, result.Credential.ID, result.Index, time.Now().Add(cooldownDuration))
-			h.logger.Warn("credential rejected by upstream (quota/auth/balance limit) — rotating to next key",
-				zap.String("request_id", fmt.Sprintf("%v", requestID)),
-				zap.String("model", pctx.model),
-				zap.String("provider", result.Credential.Provider),
-				zap.String("upstream_url", upstreamURL),
-				zap.Int("status", recStatus),
-				zap.Int("credential_id", result.Credential.ID),
-				zap.Int("keys_tried", triedCount),
-				zap.Duration("cooldown", cooldownDuration),
-			)
-			continue // immediately rotate
-		}
-
-		// Fast fail for 404 Not Found:
-		// If upstream returns 404 (model not found / invalid route), rotating credentials
-		// will only fail identically and penalize all healthy keys for 25m. Abort rotation.
-		if recStatus == http.StatusNotFound {
-			h.logger.Warn("upstream returned 404 not found — aborting retry loop to protect pool keys",
-				zap.String("model", pctx.model),
-				zap.String("provider", result.Credential.Provider),
-				zap.ByteString("error_body", errBody),
-			)
+		if shouldBreakLoop {
 			break retryLoop
 		}
-
-		// Fast Fail for 400 Bad Request Payload Issues (not a Puter quota error)
-		//
-		// For Jiekou: the sanitizer (sanitizeJiekouRequest) runs on every forwardRequest
-		// call and fixes known issues (jiekou/ prefix, temperature clamping, role
-		// normalization, etc.). If we get a second consecutive HTTP 400 from Jiekou,
-		// the sanitizer could not fix the root cause — it is a fundamental payload
-		// schema mismatch that rotating credentials will NOT resolve.
-		//
-		// Strategy: allow ONE jiekou 400 through (attempt index 0) as a potential
-		// first-pass sanitizer miss, then break on the second 400 to protect the
-		// remaining pool keys from pointless exhaustion.
-		//
-		// Fast Fail for 400 Bad Request Payload Issues (not a Puter quota error)
-		//
-		// Allows up to 2 attempts for a provider before concluding the payload schema
-		// is invalid, protecting remaining pool keys from pointless exhaustion.
-		if recStatus == http.StatusBadRequest {
-			// Self-heal for "unsupported sampling parameter" rejections
-			// (see sampling_params.go): the credential is healthy — the model
-			// generation just refuses the parameter. Strip it from the body
-			// and retry the same credential instead of burning the 400
-			// fast-fail budget. Each param is stripped at most once per
-			// request, so a pathological upstream cannot loop us forever.
-			if param, ok := parseUnsupportedSamplingParam(errBody); ok && !strippedSamplingParams[param] {
-				if stripped, changed := stripJSONTopLevelKeys(pctx.body, []string{param}); changed {
-					strippedSamplingParams[param] = true
-					pctx.body = stripped
-					// The failure was our payload, not the key: refund the
-					// attempt and allow the same credential to be re-acquired.
-					delete(triedIndices, result.Index)
-					triedCount--
-					h.logger.Warn("upstream rejected unsupported sampling parameter — stripped it and retrying same credential",
-						zap.String("request_id", fmt.Sprintf("%v", requestID)),
-						zap.String("model", pctx.model),
-						zap.String("provider", result.Credential.Provider),
-						zap.Int("credential_id", result.Credential.ID),
-						zap.String("param", param),
-					)
-					continue retryLoop
-				}
-			}
-
-			provider400Count := 0
-			for _, a := range attempts {
-				// Transient upstream-side 400s ("The upstream provider
-				// returned an error while processing this request.") are not
-				// payload schema errors — exclude them from the abort count.
-				if a.provider == result.Credential.Provider && a.statusCode == http.StatusBadRequest && !a.transient400 {
-					provider400Count++
-				}
-			}
-			if provider400Count >= 2 && !isTransientUpstream400(errBody) {
-				h.logger.Error("payload schema error — aborting rotation to protect remaining pool keys",
-					zap.String("model", pctx.model),
-					zap.String("provider", result.Credential.Provider),
-					zap.Int("status", recStatus),
-					zap.Int("provider_400_count", provider400Count),
-					zap.ByteString("error_body", errBody),
-				)
-				break retryLoop
-			}
-		}
-
-		if recStatus == http.StatusTooManyRequests && isSingleKey {
-			// 429 on a single-key pool: abort — no other key to rotate to.
-			result.FromPool.PenalizeToken(result.Index, cooldownDuration)
-			h.broadcaster.PublishPenalize(result.FromPool.ModelPattern, result.Credential.ID, result.Index, time.Now().Add(cooldownDuration))
-			h.logger.Warn("rate-limited on single-key pool — aborting retries",
-				zap.String("request_id", fmt.Sprintf("%v", requestID)),
-				zap.String("model", pctx.model),
-				zap.String("provider", result.Credential.Provider),
-				zap.Int("status", recStatus),
-				zap.Duration("cooldown", cooldownDuration),
-			)
-			break retryLoop // labeled break exits the for loop, not just a switch
-		}
-
-		// All other non-2xx (429 multi-key, 5xx, non-standard, transport-mapped 502/504):
-		// apply cooldown and rotate to the next available key.
-		if isSingleKey {
-			cooldownDuration = 300 * time.Millisecond
-		}
-		result.FromPool.PenalizeToken(result.Index, cooldownDuration)
-		h.broadcaster.PublishPenalize(result.FromPool.ModelPattern, result.Credential.ID, result.Index, time.Now().Add(cooldownDuration))
-		h.logger.Warn("upstream request failed — rotating to next key",
-			zap.String("request_id", fmt.Sprintf("%v", requestID)),
-			zap.String("model", pctx.model),
-			zap.String("provider", result.Credential.Provider),
-			zap.String("upstream_url", upstreamURL),
-			zap.String("tenant_id", pctx.tenantID),
-			zap.Int("status", recStatus),
-			zap.Int("spins", spins),
-			zap.Int("max_attempts", maxAttempts),
-			zap.Int("keys_tried", triedCount),
-			zap.Duration("cooldown", cooldownDuration),
-			zap.Duration("elapsed", time.Since(requestStart)),
-			zap.NamedError("transport_err", err),
-		)
 	}
 
 	// ── Retry-Round Policy (never switch providers on the first failure) ──────
@@ -1177,7 +1381,7 @@ retryLoop:
 	// maxAttempts). If they fired on the very last key they still land here,
 	// but their statuses are all non-retryable, so the guard below routes them
 	// straight to the cross-provider fallback instead of burning retry rounds.
-	if triedCount >= maxAttempts && round < retryRoundsPerPool {
+	if (triedCount >= maxAttempts || (pctx.pool != nil && len(triedIndices) >= int(pctx.pool.TotalCount))) && round < retryRoundsPerPool {
 		lastRoundRetryable := false
 		for _, a := range attempts[roundStartIdx:] {
 			if !isNonRetryableCredentialStatus(a.statusCode) {
@@ -1248,11 +1452,29 @@ retryLoop:
 			fallbacks = FindExactModelFallbacks(pctx.pool.ModelPattern, triedPools, allPools)
 		}
 
-		// Also check configured DB fallback if it matches the exact same model & version
-		if len(fallbacks) == 0 && pctx.pool != nil && pctx.pool.FallbackPool != nil {
+		// Prioritize configured DB fallback pool if healthy and untried
+		if pctx.pool != nil && pctx.pool.FallbackPool != nil {
 			fb := pctx.pool.FallbackPool
-			if !triedPools[fb.ModelPattern] && IsSameModelAndVersion(targetModelRef, fb.ModelPattern) && fb.HealthyCount() > 0 {
-				fallbacks = []*credentials.BalancedChannelPool{fb}
+			if !triedPools[fb.ModelPattern] && fb.HealthyCount() > 0 {
+				alreadyPresent := false
+				for _, cand := range fallbacks {
+					if cand.ModelPattern == fb.ModelPattern {
+						alreadyPresent = true
+						break
+					}
+				}
+				if alreadyPresent {
+					var reordered []*credentials.BalancedChannelPool
+					reordered = append(reordered, fb)
+					for _, cand := range fallbacks {
+						if cand.ModelPattern != fb.ModelPattern {
+							reordered = append(reordered, cand)
+						}
+					}
+					fallbacks = reordered
+				} else {
+					fallbacks = append([]*credentials.BalancedChannelPool{fb}, fallbacks...)
+				}
 			}
 		}
 
@@ -1280,8 +1502,8 @@ retryLoop:
 			if maxAttempts < 1 {
 				maxAttempts = 1
 			}
-			if maxAttempts > 20 {
-				maxAttempts = 20
+			if maxAttempts > 100 {
+				maxAttempts = 100
 			}
 			maxSpins = maxAttempts*3 + 1
 			spins = 0
@@ -1359,8 +1581,15 @@ retryLoop:
 		h.pipeline.Emit(entry)
 	}
 
-	// Never dump raw upstream bytes — always return a canonical OpenAI error envelope.
-	finalBody := formatOpenAIError(respStatus, lastErrBody, summary)
+	// Never dump raw upstream bytes — always return a canonical error envelope.
+	// Anthropic front-door requests receive the Anthropic-shaped envelope
+	// ({"type":"error","error":{...}}); OpenAI requests keep the flat envelope.
+	var finalBody []byte
+	if pctx.anthropicFront {
+		finalBody = formatAnthropicGatewayError(respStatus, lastErrBody, summary)
+	} else {
+		finalBody = formatOpenAIError(respStatus, lastErrBody, summary)
+	}
 	c.Data(respStatus, "application/json", finalBody)
 }
 
@@ -1448,6 +1677,40 @@ func (h *Handler) forwardRequest(c *gin.Context, pctx *proxyContext) (statusCode
 	modelName := pctx.model
 	bodyBytes := pctx.body
 
+	// ── Anthropic front door: per-credential request preparation ──────────
+	// The Anthropic-compatible front API (/v1/messages) may route to native
+	// Anthropic-protocol credentials (zero-copy passthrough) or to any other
+	// provider (canonical OpenAI payload produced by TranslateAnthropicToOpenAI).
+	// The decision is per-credential because a pool can mix providers.
+	anthropicNative := false
+	if pctx.anthropicFront {
+		anthropicNative = isNativeAnthropicProvider(cred.Provider)
+		if anthropicNative {
+			prepared, pErr := PrepareNativeAnthropicPayload(pctx.anthropicRawBody, stripAnthropicRoutingModel(modelName, ""))
+			if pErr != nil {
+				return http.StatusBadRequest, upstreamURL, formatAnthropicGatewayError(http.StatusBadRequest,
+					nil, "failed to prepare native Anthropic payload: "+pErr.Error()), nil
+			}
+			bodyBytes = prepared
+		} else if pctx.anthropicTranslated == nil {
+			// The pool was all-native so translation was deferred; the first
+			// non-native credential (usually a cross-provider fallback) needs
+			// the canonical OpenAI payload now. Translate from the current
+			// body so any fallback model rewrite is preserved.
+			translated, tErr := TranslateAnthropicToOpenAI(pctx.body, FormatUpstreamModelForPattern(modelName), anthropicFallbackMaxTokens)
+			if tErr != nil {
+				return http.StatusBadRequest, upstreamURL, formatAnthropicGatewayError(http.StatusBadRequest,
+					nil, "failed to translate Anthropic request: "+tErr.Error()), nil
+			}
+			if pctx.isNvidia && supportsNvidiaReasoning(modelName) {
+				translated = injectNvidiaParams(translated, translated, h.logger)
+			}
+			pctx.anthropicTranslated = translated
+			pctx.body = translated
+			bodyBytes = translated
+		}
+	}
+
 	// If the credential has an optional prefix, we must strip it from both the model ID
 	// passed to the rewriter and the JSON payload sent upstream.
 	if cred.Prefix != "" {
@@ -1457,9 +1720,12 @@ func (h *Handler) forwardRequest(c *gin.Context, pctx *proxyContext) (statusCode
 
 			// Replace model name inside JSON body bytes.
 			// Same O(n) replacement logic as nvidia/ollama.
-			oldToken := []byte(`"` + pctx.model + `"`)
-			newToken := []byte(`"` + modelName + `"`)
-			bodyBytes = bytes.Replace(bodyBytes, oldToken, newToken, 1)
+			// (Native Anthropic payloads are rebuilt below with the stripped name.)
+			if !anthropicNative {
+				oldToken := []byte(`"` + pctx.model + `"`)
+				newToken := []byte(`"` + modelName + `"`)
+				bodyBytes = bytes.Replace(bodyBytes, oldToken, newToken, 1)
+			}
 		}
 	}
 
@@ -1470,7 +1736,9 @@ func (h *Handler) forwardRequest(c *gin.Context, pctx *proxyContext) (statusCode
 	// code 7003). Strip temperature/top_p/top_k up-front for these models on
 	// every provider — aggregators already drop them, strict Anthropic-schema
 	// endpoints reject them. See sampling_params.go for the full rationale.
-	if modelDisallowsSamplingParams(modelName) {
+	// Native Anthropic passthrough is exempt: temperature/top_p/top_k are
+	// legal Anthropic sampling controls that the client sent deliberately.
+	if !anthropicNative && modelDisallowsSamplingParams(modelName) {
 		bodyBytes = stripSamplingParams(bodyBytes)
 	}
 
@@ -1636,7 +1904,7 @@ func (h *Handler) forwardRequest(c *gin.Context, pctx *proxyContext) (statusCode
 	// the response directly to c.Writer and returns a telemetry blob as errBody.
 	// The early return naturally bypasses URL construction, h.client.Do, and the old
 	// Gemini response translation below — those blocks remain as dead code for rollback.
-	if cred.Provider == "gemini" {
+	if cred.Provider == "gemini" && (cred.BaseURL == "" || strings.HasPrefix(cred.BaseURL, "https://generativelanguage.googleapis.com")) {
 		sdkStatus, sdkBody, sdkErr := h.executeGeminiWithSDK(c, pctx, cred.APIKey, bodyBytes)
 		if sdkErr != nil {
 			h.logger.Error("gemini sdk executor error",
@@ -1696,8 +1964,13 @@ func (h *Handler) forwardRequest(c *gin.Context, pctx *proxyContext) (statusCode
 		upstreamURL += "?isStreaming=true"
 	}
 
+	reqCtx := c.Request.Context()
+	if pctx.requestContext != nil {
+		reqCtx = pctx.requestContext
+	}
+
 	upstreamReq, err := http.NewRequestWithContext(
-		c.Request.Context(),
+		reqCtx,
 		c.Request.Method,
 		upstreamURL,
 		bytes.NewReader(bodyBytes),
@@ -1707,6 +1980,18 @@ func (h *Handler) forwardRequest(c *gin.Context, pctx *proxyContext) (statusCode
 	}
 
 	h.rewriter.RewriteHeaders(upstreamReq, cred.Provider, cred.APIKey, c.Request.Header)
+
+	// ── Anthropic prompt caching (Phase 4) ─────────────────────────────────
+	// Native Anthropic upstreams reject cache_control breakpoints unless the
+	// request advertises the prompt-caching beta. Inject the flag when the
+	// body uses caching and the client did not send an anthropic-beta header.
+	// AgentRouter keeps its fixed Claude Code fingerprint (set above); every
+	// other provider is untouched.
+	if anthropicNative {
+		if beta := AnthropicPromptCachingBeta(bodyBytes, upstreamReq.Header.Get("anthropic-beta")); beta != "" {
+			upstreamReq.Header.Set("anthropic-beta", beta)
+		}
+	}
 
 	// --- Puter Edge Firewall De-fingerprinting ---
 	if cred.Provider == "puter" {
@@ -1745,7 +2030,7 @@ func (h *Handler) forwardRequest(c *gin.Context, pctx *proxyContext) (statusCode
 			)
 
 			fallbackReq, fbErr := http.NewRequestWithContext(
-				c.Request.Context(),
+				reqCtx,
 				c.Request.Method,
 				fallbackURL,
 				bytes.NewReader(bodyBytes),
@@ -1807,7 +2092,7 @@ func (h *Handler) forwardRequest(c *gin.Context, pctx *proxyContext) (statusCode
 
 			// Retry the original request with the agreed credential
 			retryReq, reqErr := http.NewRequestWithContext(
-				c.Request.Context(),
+				reqCtx,
 				c.Request.Method,
 				upstreamURL,
 				bytes.NewReader(bodyBytes),
@@ -1888,7 +2173,7 @@ handleSuccess:
 				// function-level `defer resp.Body.Close()` captured the
 				// original body at defer time, so it is still closed exactly
 				// once; ProxyStream closing the NopCloser wrapper is a no-op.
-				resp.Body = io.NopCloser(&prefixReplayReader{prefix: res.replay, rest: resp.Body})
+				resp.Body = res.body
 			} else if !pctx.isStream && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				prefix, truncated := readPrefix(resp.Body, nonStreamSniffLimit)
 				if len(prefix) > 0 && (ct != "" || isLikelyTextual(prefix)) {
@@ -1909,11 +2194,38 @@ handleSuccess:
 		}
 	}
 
+	if pctx.coordinator != nil {
+		if !pctx.coordinator.claimVictory(pctx.workerIndex) {
+			return resp.StatusCode, upstreamURL, nil, context.Canceled
+		}
+	}
+
 	// --- Success stream path ---
 	if pctx.isStream && resp.StatusCode == http.StatusOK {
 		c.Writer.Header().Set("X-Gateway-Provider", cred.Provider)
 		c.Writer.Header().Set("X-Gateway-Model-Pattern", pctx.model)
-		responseText, completionTokens := h.stream.ProxyStream(c, resp, cred.Provider, pctx.requestedModel)
+		if anthropicNative {
+			// Zero-copy passthrough: the upstream already speaks the Anthropic
+			// SSE protocol the client expects — relay bytes verbatim. Phase 3
+			// will add the reverse (OpenAI → Anthropic) SSE encoder for the
+			// non-native providers that reach the branch below.
+			_, completionTokens := h.stream.ProxyStreamRaw(c, resp)
+			type rawStreamResult struct {
+				Text   string `json:"text"`
+				Tokens int    `json:"tokens"`
+			}
+			resJSON, _ := json.Marshal(rawStreamResult{Text: "", Tokens: completionTokens})
+			return resp.StatusCode, upstreamURL, resJSON, nil
+		}
+		// Anthropic front door via a non-native provider (Phase 3+4): the
+		// client expects Anthropic Messages SSE, so the relay re-encodes the
+		// OpenAI-format chunks produced by the transmux layer.
+		proxyStreamOpts := []ProxyStreamOption(nil)
+		if pctx.anthropicFront {
+			msgID := "msg_gate_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+			proxyStreamOpts = []ProxyStreamOption{WithAnthropicStream(msgID, pctx.requestedModel, pctx.anthropicInputTokens)}
+		}
+		responseText, completionTokens := h.stream.ProxyStream(c, resp, cred.Provider, pctx.requestedModel, proxyStreamOpts...)
 
 		// Pack completion tokens and responseText into a temporary json to pass back to the retry worker
 		type streamResult struct {
@@ -1928,7 +2240,9 @@ handleSuccess:
 	// Only 2xx responses reach this point — safe to write to c.Writer.
 
 	// --- AgentRouter native response translation (non-streaming) ---
-	if cred.Provider == "agentrouter" {
+	// Skipped for Anthropic front-door native passthrough: the response is
+	// already in the exact Anthropic shape the client requested.
+	if cred.Provider == "agentrouter" && !anthropicNative {
 		respBody, readErr := io.ReadAll(resp.Body)
 		if readErr != nil {
 			return http.StatusInternalServerError, upstreamURL, nil, readErr
@@ -1937,13 +2251,24 @@ handleSuccess:
 			respBody = translated
 		}
 		respBody = h.normalizeNonStreamingReasoning(respBody)
+		respBody = h.sanitizeNonStreamingToolCalls(respBody)
 		respBody = h.rewriteResponseModel(respBody, pctx.requestedModel)
+		if pctx.anthropicFront {
+			anthBytes, _, _, _, aErr := TranslateOpenAIToAnthropicResponse(respBody, pctx.requestedModel, pctx.anthropicInputTokens)
+			if aErr == nil && len(anthBytes) > 0 {
+				respBody = anthBytes
+			}
+		}
 		for key, vals := range resp.Header {
+			if strings.EqualFold(key, "Content-Length") {
+				continue
+			}
 			for _, val := range vals {
 				c.Writer.Header().Add(key, val)
 			}
 		}
 		c.Writer.Header().Set("Content-Type", "application/json")
+		c.Writer.Header().Set("Content-Length", strconv.Itoa(len(respBody)))
 		c.Writer.Header().Set("X-Gateway-Provider", cred.Provider)
 		c.Writer.Header().Set("X-Gateway-Model-Pattern", pctx.model)
 		c.Writer.WriteHeader(resp.StatusCode)
@@ -1963,7 +2288,14 @@ handleSuccess:
 		if translated, ok := translateOllamaResponse(respBody); ok {
 			respBody = translated
 			respBody = h.normalizeNonStreamingReasoning(respBody)
+			respBody = h.sanitizeNonStreamingToolCalls(respBody)
 			respBody = h.rewriteResponseModel(respBody, pctx.requestedModel)
+			if pctx.anthropicFront {
+				anthBytes, _, _, _, aErr := TranslateOpenAIToAnthropicResponse(respBody, pctx.requestedModel, pctx.anthropicInputTokens)
+				if aErr == nil && len(anthBytes) > 0 {
+					respBody = anthBytes
+				}
+			}
 			for key, vals := range resp.Header {
 				for _, val := range vals {
 					c.Writer.Header().Add(key, val)
@@ -1977,6 +2309,12 @@ handleSuccess:
 			return resp.StatusCode, upstreamURL, respBody, nil
 		}
 		// Ollama response didn't match native format — fall through to stream as-is
+		if pctx.anthropicFront {
+			anthBytes, _, _, _, aErr := TranslateOpenAIToAnthropicResponse(respBody, pctx.requestedModel, pctx.anthropicInputTokens)
+			if aErr == nil && len(anthBytes) > 0 {
+				respBody = anthBytes
+			}
+		}
 		for key, vals := range resp.Header {
 			for _, val := range vals {
 				c.Writer.Header().Add(key, val)
@@ -2019,7 +2357,15 @@ handleSuccess:
 		translated, contentType, trErr := translateOneMinAIResponse(pctx.model, respBody)
 		if trErr == nil && translated != nil {
 			translated = h.normalizeNonStreamingReasoning(translated)
+			translated = h.sanitizeNonStreamingToolCalls(translated)
 			translated = h.rewriteResponseModel(translated, pctx.requestedModel)
+			if pctx.anthropicFront {
+				anthBytes, _, _, _, aErr := TranslateOpenAIToAnthropicResponse(translated, pctx.requestedModel, pctx.anthropicInputTokens)
+				if aErr == nil && len(anthBytes) > 0 {
+					translated = anthBytes
+					contentType = "application/json"
+				}
+			}
 			c.Writer.Header().Set("Content-Type", contentType)
 			c.Writer.Header().Set("X-Gateway-Provider", cred.Provider)
 			c.Writer.Header().Set("X-Gateway-Model-Pattern", pctx.model)
@@ -2093,7 +2439,14 @@ handleSuccess:
 
 		// Apply thinking-tag normalization and model rewriting
 		translated = h.normalizeNonStreamingReasoning(translated)
+		translated = h.sanitizeNonStreamingToolCalls(translated)
 		translated = h.rewriteResponseModel(translated, pctx.requestedModel)
+		if pctx.anthropicFront {
+			anthBytes, _, _, _, aErr := TranslateOpenAIToAnthropicResponse(translated, pctx.requestedModel, pctx.anthropicInputTokens)
+			if aErr == nil && len(anthBytes) > 0 {
+				translated = anthBytes
+			}
+		}
 		c.Writer.Header().Set("Content-Type", "application/json")
 		c.Writer.Header().Set("X-Gateway-Provider", cred.Provider)
 		c.Writer.Header().Set("X-Gateway-Model-Pattern", pctx.model)
@@ -2236,16 +2589,34 @@ handleSuccess:
 		// Normalize inline <think> tags into structured reasoning_content so
 		// front-ends render a thinking panel instead of raw reasoning text.
 		respBody = h.normalizeNonStreamingReasoning(respBody)
+		respBody = h.sanitizeNonStreamingToolCalls(respBody)
 		respBody = h.rewriteResponseModel(respBody, pctx.requestedModel)
 	}
 
+	// ── Anthropic front door: non-streaming response translation (Phase 3+4) ──
+	// Everything below writes the OpenAI chat-completion body to the client.
+	// Anthropic front-door requests served by non-native providers must
+	// receive an Anthropic Messages envelope instead, so re-shape the
+	// normalized OpenAI body now (thinking blocks, text, tool_use, usage with
+	// prompt-cache fields, Anthropic stop_reason vocabulary).
+	if pctx.anthropicFront && !anthropicNative && isJSON && len(respBody) > 0 {
+		anthBytes, _, _, _, aErr := TranslateOpenAIToAnthropicResponse(respBody, pctx.requestedModel, pctx.anthropicInputTokens)
+		if aErr == nil && len(anthBytes) > 0 {
+			respBody = anthBytes
+		}
+	}
+
 	for key, vals := range resp.Header {
+		if strings.EqualFold(key, "Content-Length") {
+			continue
+		}
 		for _, val := range vals {
 			c.Writer.Header().Add(key, val)
 		}
 	}
 	if isJSON {
 		c.Writer.Header().Set("Content-Type", "application/json")
+		c.Writer.Header().Set("Content-Length", strconv.Itoa(len(respBody)))
 	}
 	c.Writer.Header().Set("X-Gateway-Provider", cred.Provider)
 	c.Writer.Header().Set("X-Gateway-Model-Pattern", pctx.model)
@@ -2340,6 +2711,85 @@ func (h *Handler) normalizeNonStreamingReasoning(body []byte) []byte {
 		return body
 	}
 	return updated
+}
+
+// sanitizeNonStreamingToolCalls ensures that tool_calls in non-streaming responses
+// contain valid non-null strings for id, type, function.name, and function.arguments.
+func (h *Handler) sanitizeNonStreamingToolCalls(body []byte) []byte {
+	if len(body) == 0 || !bytes.Contains(body, []byte(`"tool_calls"`)) {
+		return body
+	}
+	if !bytes.Contains(body, []byte(`:null`)) && !bytes.Contains(body, []byte(`: null`)) {
+		return body
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+
+	choices, ok := payload["choices"].([]interface{})
+	if !ok || len(choices) == 0 {
+		return body
+	}
+
+	modified := false
+	for _, choice := range choices {
+		chMap, ok := choice.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		msg, ok := chMap["message"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		tcs, ok := msg["tool_calls"].([]interface{})
+		if !ok {
+			continue
+		}
+		for i, tc := range tcs {
+			tcMap, ok := tc.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if tcMap["id"] == nil || tcMap["id"] == "" {
+				tcMap["id"] = fmt.Sprintf("call_%x_%d", time.Now().UnixNano(), i)
+				modified = true
+			}
+			if tcMap["type"] == nil || tcMap["type"] == "" {
+				tcMap["type"] = "function"
+				modified = true
+			}
+			if fn, ok := tcMap["function"].(map[string]interface{}); ok {
+				var toolName string
+				if fn["name"] == nil {
+					fn["name"] = ""
+					modified = true
+				} else if nameStr, isStr := fn["name"].(string); isStr {
+					toolName = nameStr
+				}
+				if fn["arguments"] == nil {
+					fn["arguments"] = "{}"
+					modified = true
+				} else if argsStr, isStr := fn["arguments"].(string); isStr {
+					repaired := RepairToolArguments(toolName, argsStr)
+					if repaired != argsStr {
+						fn["arguments"] = repaired
+						modified = true
+					}
+				}
+			}
+		}
+	}
+
+	if !modified {
+		return body
+	}
+	cleaned, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return cleaned
 }
 
 // translateOllamaResponse converts a native Ollama non-streaming response body
@@ -2687,13 +3137,15 @@ func cooldownForStatus(status int) time.Duration {
 	case status == http.StatusUnauthorized ||
 		status == http.StatusPaymentRequired ||
 		status == http.StatusForbidden ||
-		status == http.StatusNotFound ||
-		status == http.StatusUnprocessableEntity:
-		// Transient cooldown — do not deactivate or disable credential
-		return 10 * time.Second
+		status == http.StatusNotFound:
+		// Quota depletion, suspended account, or invalid credentials
+		return 30 * time.Minute
+
+	case status == http.StatusUnprocessableEntity:
+		return 10 * time.Minute
 
 	case status == http.StatusTooManyRequests:
-		return 10 * time.Second // Rate limited — short wait for window reset
+		return 15 * time.Second // Rate limited — short wait for window reset
 
 	case status == http.StatusInternalServerError || status == http.StatusBadGateway:
 		return 3 * time.Second // Server error — transient cooldown
@@ -2710,25 +3162,65 @@ func cooldownForStatus(status int) time.Duration {
 	}
 }
 
-// ModelDetail represents model information in OpenAI format.
-// The Capabilities field is a gateway extension — OpenAI clients ignore
-// unknown fields, so this is safe for all compliant tooling.
+// ModelDetail represents model information in dual OpenAI and Anthropic format.
+// Both schemas are additive and non-conflicting:
+// OpenAI fields: id, object, created, owned_by, capabilities
+// Anthropic fields: id, type, display_name, created_at
 type ModelDetail struct {
 	ID           string          `json:"id"`
 	Object       string          `json:"object"`
+	Type         string          `json:"type"`
+	DisplayName  string          `json:"display_name"`
 	Created      int64           `json:"created"`
+	CreatedAt    string          `json:"created_at"`
 	OwnedBy      string          `json:"owned_by"`
 	Capabilities map[string]bool `json:"capabilities,omitempty"`
 }
 
-// ModelListResponse represents the OpenAI list models response.
+// ModelListResponse represents the dual-compatible list models response.
+// OpenAI fields: object, data
+// Anthropic fields: data, has_more, first_id, last_id
 type ModelListResponse struct {
-	Object string        `json:"object"`
-	Data   []ModelDetail `json:"data"`
+	Object  string        `json:"object"`
+	Data    []ModelDetail `json:"data"`
+	HasMore bool          `json:"has_more"`
+	FirstID string        `json:"first_id"`
+	LastID  string        `json:"last_id"`
+}
+
+func newModelDetail(pattern string, caps map[string]bool, now int64) ModelDetail {
+	return ModelDetail{
+		ID:           pattern,
+		Object:       "model",
+		Type:         "model",
+		DisplayName:  pattern,
+		Created:      now,
+		CreatedAt:    time.Unix(now, 0).UTC().Format(time.RFC3339),
+		OwnedBy:      "clever-ai-gate",
+		Capabilities: caps,
+	}
+}
+
+func newModelListResponse(data []ModelDetail) ModelListResponse {
+	if data == nil {
+		data = []ModelDetail{}
+	}
+	var firstID, lastID string
+	if len(data) > 0 {
+		firstID = data[0].ID
+		lastID = data[len(data)-1].ID
+	}
+	return ModelListResponse{
+		Object:  "list",
+		Data:    data,
+		HasMore: false,
+		FirstID: firstID,
+		LastID:  lastID,
+	}
 }
 
 // ListModels returns a list of configured active model pools with their
-// detected capabilities in OpenAI-compatible format.
+// detected capabilities in dual OpenAI and Anthropic format.
 //
 // Read order:
 //  1. If refresh requested (?refresh=true or Cache-Control: no-cache): bypass cache and query DB
@@ -2749,18 +3241,9 @@ func (h *Handler) ListModels(c *gin.Context) {
 			if found && len(redisModels) > 0 {
 				data = make([]ModelDetail, len(redisModels))
 				for i, m := range redisModels {
-					data[i] = ModelDetail{
-						ID:           m.Pattern,
-						Object:       "model",
-						Created:      now,
-						OwnedBy:      "clever-ai-gate",
-						Capabilities: m.Capabilities,
-					}
+					data[i] = newModelDetail(m.Pattern, m.Capabilities, now)
 				}
-				c.JSON(http.StatusOK, ModelListResponse{
-					Object: "list",
-					Data:   data,
-				})
+				c.JSON(http.StatusOK, newModelListResponse(data))
 				return
 			}
 		}
@@ -2772,13 +3255,7 @@ func (h *Handler) ListModels(c *gin.Context) {
 			if models, ok := val.([]credentials.ActiveModel); ok && len(models) > 0 {
 				data = make([]ModelDetail, len(models))
 				for i, m := range models {
-					data[i] = ModelDetail{
-						ID:           m.Pattern,
-						Object:       "model",
-						Created:      now,
-						OwnedBy:      "clever-ai-gate",
-						Capabilities: m.Capabilities,
-					}
+					data[i] = newModelDetail(m.Pattern, m.Capabilities, now)
 				}
 				// Back-fill Redis L2 asynchronously from Ristretto L1 data.
 				// This heals a Redis cache miss without blocking the response.
@@ -2794,10 +3271,7 @@ func (h *Handler) ListModels(c *gin.Context) {
 						h.redisCacheMgr.SetJSON(context.Background(), cache.KeyActiveModels, entries, cache.DefaultCacheTTL)
 					}(models)
 				}
-				c.JSON(http.StatusOK, ModelListResponse{
-					Object: "list",
-					Data:   data,
-				})
+				c.JSON(http.StatusOK, newModelListResponse(data))
 				return
 			}
 		}
@@ -2825,13 +3299,7 @@ func (h *Handler) ListModels(c *gin.Context) {
 			if len(activeModels) > 0 {
 				data = make([]ModelDetail, len(activeModels))
 				for i, m := range activeModels {
-					data[i] = ModelDetail{
-						ID:           m.Pattern,
-						Object:       "model",
-						Created:      now,
-						OwnedBy:      "clever-ai-gate",
-						Capabilities: m.Capabilities,
-					}
+					data[i] = newModelDetail(m.Pattern, m.Capabilities, now)
 				}
 
 				// Populate both Ristretto L1 and Redis L2
@@ -2854,9 +3322,102 @@ func (h *Handler) ListModels(c *gin.Context) {
 		data = []ModelDetail{}
 	}
 
-	c.JSON(http.StatusOK, ModelListResponse{
-		Object: "list",
-		Data:   data,
+	c.JSON(http.StatusOK, newModelListResponse(data))
+}
+
+// GetModel retrieves a single model by ID, supporting slash-prefixed model names
+// (e.g. "anthropic/claude-3-7-sonnet" or "deepseek-ai/DeepSeek-R1").
+// Returns a dual-compatible model representation with both OpenAI and Anthropic fields.
+func (h *Handler) GetModel(c *gin.Context) {
+	rawModel := c.Param("model")
+	modelID := strings.TrimPrefix(rawModel, "/")
+	if modelID == "" {
+		h.ListModels(c)
+		return
+	}
+
+	now := time.Now().Unix()
+	var foundModel *ModelDetail
+
+	// 1. Check SyncManager if available
+	if h.syncManager != nil {
+		if pool := h.syncManager.GetPool(modelID); pool != nil {
+			m := newModelDetail(pool.ModelPattern, nil, now)
+			foundModel = &m
+		}
+	}
+
+	// 2. Check in-process cache (system:active_models)
+	if h.cache != nil {
+		if val, found := h.cache.Get("system:active_models"); found {
+			if models, ok := val.([]credentials.ActiveModel); ok {
+				for _, m := range models {
+					if m.Pattern == modelID {
+						if foundModel != nil {
+							foundModel.Capabilities = m.Capabilities
+						} else {
+							detail := newModelDetail(m.Pattern, m.Capabilities, now)
+							foundModel = &detail
+						}
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// 3. Check Redis L2 cache if available
+	if foundModel == nil && h.redisCacheMgr != nil {
+		var redisModels []cache.ActiveModelEntry
+		found, _ := h.redisCacheMgr.GetJSON(c.Request.Context(), cache.KeyActiveModels, &redisModels)
+		if found {
+			for _, m := range redisModels {
+				if m.Pattern == modelID {
+					detail := newModelDetail(m.Pattern, m.Capabilities, now)
+					foundModel = &detail
+					break
+				}
+			}
+		}
+	}
+
+	// 4. DB Fallback if available
+	if foundModel == nil && h.db != nil {
+		var pattern string
+		var capsJSON []byte
+		err := h.db.QueryRow(c.Request.Context(),
+			`SELECT model_pattern, capabilities FROM model_pools WHERE model_pattern = $1 AND is_active = true`,
+			modelID,
+		).Scan(&pattern, &capsJSON)
+		if err == nil {
+			var caps map[string]bool
+			if len(capsJSON) > 0 && string(capsJSON) != "{}" {
+				_ = json.Unmarshal(capsJSON, &caps)
+			}
+			detail := newModelDetail(pattern, caps, now)
+			foundModel = &detail
+		}
+	}
+
+	if foundModel != nil {
+		c.JSON(http.StatusOK, foundModel)
+		return
+	}
+
+	// Not found: dual-protocol error response
+	isAnthropic := c.GetHeader("anthropic-version") != "" || (c.GetHeader("x-api-key") != "" && !strings.HasPrefix(c.GetHeader("Authorization"), "Bearer "))
+	if isAnthropic {
+		AnthropicErrorResponse(c, http.StatusNotFound, "not_found_error", fmt.Sprintf("model not found: %s", modelID))
+		return
+	}
+
+	c.JSON(http.StatusNotFound, gin.H{
+		"error": gin.H{
+			"message": fmt.Sprintf("The model '%s' does not exist", modelID),
+			"type":    "invalid_request_error",
+			"param":   "model",
+			"code":    "model_not_found",
+		},
 	})
 }
 
@@ -3071,12 +3632,42 @@ func extractResponseText(body []byte) string {
 	if content, err := jsonparser.GetString(body, "choices", "[0]", "text"); err == nil {
 		return content
 	}
-	return ""
+	// Anthropic response format: content: [{"type":"text","text":"..."}, {"type":"thinking","thinking":"..."}]
+	if cVal, cType, _, err := jsonparser.Get(body, "content"); err == nil && cType == jsonparser.Array {
+		jsonparser.ArrayEach(cVal, func(block []byte, dataType jsonparser.ValueType, _ int, _ error) {
+			if t, _ := jsonparser.GetString(block, "type"); t == "text" {
+				if txt, _ := jsonparser.GetString(block, "text"); txt != "" {
+					if sb.Len() > 0 {
+						sb.WriteByte('\n')
+					}
+					sb.WriteString(txt)
+				}
+			} else if t == "thinking" {
+				if th, _ := jsonparser.GetString(block, "thinking"); th != "" {
+					if sb.Len() > 0 {
+						sb.WriteByte('\n')
+					}
+					sb.WriteString(th)
+				}
+			}
+		})
+	}
+	return sb.String()
 }
 
 func extractTokens(body []byte, promptOrCompletion string) int {
 	if val, err := jsonparser.GetInt(body, "usage", promptOrCompletion+"_tokens"); err == nil {
 		return int(val)
+	}
+	// Anthropic response format
+	if promptOrCompletion == "prompt" {
+		if val, err := jsonparser.GetInt(body, "usage", "input_tokens"); err == nil {
+			return int(val)
+		}
+	} else if promptOrCompletion == "completion" {
+		if val, err := jsonparser.GetInt(body, "usage", "output_tokens"); err == nil {
+			return int(val)
+		}
 	}
 	return 0
 }

@@ -94,11 +94,14 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 					c.Header("Retry-After", fmt.Sprintf("%d", retryAfter))
 					c.Header("X-RateLimit-Limit", fmt.Sprintf("%d", limit))
 					c.Header("X-RateLimit-Remaining", "0")
-					c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-						"error":       "rate limit exceeded",
-						"limit":       limit,
-						"retry_after": retryAfter,
-					})
+					// Anthropic clients (/v1/messages) receive the nested error
+					// envelope with type "rate_limit_error"; OpenAI-compatible
+					// clients keep the flat {"error":..., "limit":..., "retry_after":...}.
+					abortWithProtocolError(c, http.StatusTooManyRequests, "rate_limit_error", "rate limit exceeded",
+						gin.H{
+							"limit":       limit,
+							"retry_after": retryAfter,
+						})
 					return
 				}
 				newState = (currentMinute << 32) | count

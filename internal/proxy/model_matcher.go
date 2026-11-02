@@ -2,13 +2,19 @@ package proxy
 
 import (
 	"regexp"
+	"sort"
 	"strings"
+	"sync/atomic"
 
 	"github.com/skadraneshghn/clever-ai-gate/internal/credentials"
 )
 
 // KnownProviderPrefixes lists standard routing namespaces used in the gateway.
 var KnownProviderPrefixes = []string{
+	"routerai/",
+	"true-sota/",
+	"tokenrouter/",
+	"cleanapis/",
 	"nvidia/",
 	"openrouter/",
 	"ollama/",
@@ -23,9 +29,14 @@ var KnownProviderPrefixes = []string{
 	"novita/",
 	"together/",
 	"groq/",
+	"cerebras/",
+	"sambanova/",
+	"siliconflow/",
 	"fireworks/",
 	"mistral/",
 	"perplexity/",
+	"ofox/",
+	"aplikasinala/",
 }
 
 // KnownPublisherPrefixes lists common model vendor/organization namespaces.
@@ -164,9 +175,80 @@ func IsSameModelAndVersion(patternA, patternB string) bool {
 	return coreA != "" && coreA == coreB
 }
 
+// ProviderReliabilityScore returns a baseline reputation score for an upstream provider.
+// Higher scores are prioritized for cross-provider fallbacks.
+func ProviderReliabilityScore(provider string) int {
+	switch strings.ToLower(provider) {
+	case "anthropic", "openai":
+		return 120
+	case "deepseek", "gemini", "groq", "cerebras":
+		return 110
+	case "together", "fireworks", "sambanova":
+		return 105
+	case "routerai":
+		return 100
+	case "true-sota":
+		return 95
+	case "tokenrouter":
+		return 90
+	case "zenmux":
+		return 85
+	case "cleanapis":
+		return 80
+	case "novita", "siliconflow", "cloudflare", "nvidia":
+		return 75
+	case "openrouter":
+		return 70
+	case "pollinations":
+		return -30
+	case "puter", "jiekou", "ofox", "aplikasinala":
+		return -50
+	default:
+		return 50
+	}
+}
+
+// CalculatePoolScore evaluates a candidate pool for fallback suitability based on
+// provider reliability, healthy key availability, and failure history.
+func CalculatePoolScore(pool *credentials.BalancedChannelPool) int {
+	if pool == nil {
+		return -1000
+	}
+
+	// 1. Identify provider
+	provider := ""
+	if len(pool.Credentials) > 0 && pool.Credentials[0] != nil {
+		provider = pool.Credentials[0].Provider
+	}
+	if provider == "" {
+		_, provider = StripProviderPrefix(pool.ModelPattern)
+	}
+
+	score := ProviderReliabilityScore(provider)
+
+	// 2. Health availability ratio bonus (up to +20 points)
+	total := int(pool.TotalCount)
+	if total > 0 {
+		healthy := pool.HealthyCount()
+		ratio := float64(healthy) / float64(total)
+		score += int(ratio * 20)
+	}
+
+	// 3. Subtract penalty for accumulated consecutive failures
+	for _, cred := range pool.Credentials {
+		if cred != nil {
+			failures := atomic.LoadUint32(&cred.ConsecutiveFailures)
+			score -= int(failures) * 10
+		}
+	}
+
+	return score
+}
+
 // FindExactModelFallbacks searches all loaded routing pools for other pools that host
 // the exact same model and version as currentModel, excluding already tried pools and
-// pools with zero healthy credentials.
+// pools with zero healthy credentials. Candidates are prioritized and sorted deterministically
+// by provider reputation, healthy key ratio, and failure history.
 func FindExactModelFallbacks(currentModel string, triedPools map[string]bool, allPools map[string]*credentials.BalancedChannelPool) []*credentials.BalancedChannelPool {
 	targetCore := ExtractCoreModelAndVersion(currentModel)
 	if targetCore == "" || len(allPools) == 0 {
@@ -201,6 +283,16 @@ func FindExactModelFallbacks(currentModel string, triedPools map[string]bool, al
 		seen[candPool.ModelPattern] = true
 		candidates = append(candidates, candPool)
 	}
+
+	// Sort candidates by score descending, then by ModelPattern ascending for determinism
+	sort.SliceStable(candidates, func(i, j int) bool {
+		scoreI := CalculatePoolScore(candidates[i])
+		scoreJ := CalculatePoolScore(candidates[j])
+		if scoreI != scoreJ {
+			return scoreI > scoreJ
+		}
+		return candidates[i].ModelPattern < candidates[j].ModelPattern
+	})
 
 	return candidates
 }

@@ -44,7 +44,7 @@ import (
 // Anthropic's migration guide that removed support for sampling overrides.
 // Opus 4.1 and older still honour temperature — do NOT add them here.
 var claudeNoSamplingModelFragments = []string{
-	"claude-opus-5",  // claude-opus-5, claude-opus-5-thinking, claude-opus-5-5, cc/claude-opus-5…
+	"claude-opus-5",   // claude-opus-5, claude-opus-5-thinking, claude-opus-5-5, cc/claude-opus-5…
 	"claude-opus-4.5", // dotted alias form
 	"claude-opus-4-5", // dashed release form (claude-opus-4-5-20251101)
 }

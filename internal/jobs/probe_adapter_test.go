@@ -110,3 +110,45 @@ func TestBuildAdaptiveProbeRequest_ImageGen(t *testing.T) {
 		t.Errorf("expected image generation URL, got %s", req.URL)
 	}
 }
+
+func TestBuildAdaptiveProbeRequest_AnthropicAndAgentRouter(t *testing.T) {
+	// 1. Anthropic native endpoint
+	antReq, err := BuildAdaptiveProbeRequest("https://api.anthropic.com/v1", "sk-ant-test", "anthropic", "anthropic/claude-3-5-sonnet", nil)
+	if err != nil {
+		t.Fatalf("unexpected error for anthropic: %v", err)
+	}
+
+	if !strings.HasSuffix(antReq.URL, "/messages") {
+		t.Errorf("expected anthropic URL ending in /messages, got %s", antReq.URL)
+	}
+	if antReq.Headers["x-api-key"] != "sk-ant-test" {
+		t.Errorf("expected x-api-key header, got %v", antReq.Headers["x-api-key"])
+	}
+	if antReq.Headers["anthropic-version"] != "2023-06-01" {
+		t.Errorf("expected anthropic-version header, got %v", antReq.Headers["anthropic-version"])
+	}
+
+	var antBody map[string]interface{}
+	if err := json.Unmarshal(antReq.Body, &antBody); err != nil {
+		t.Fatalf("invalid json body: %v", err)
+	}
+	if antBody["model"] != "claude-3-5-sonnet" {
+		t.Errorf("expected stripped model 'claude-3-5-sonnet', got %v", antBody["model"])
+	}
+	if antBody["max_tokens"] != float64(1) {
+		t.Errorf("expected max_tokens: 1, got %v", antBody["max_tokens"])
+	}
+
+	// 2. AgentRouter native endpoint
+	arReq, err := BuildAdaptiveProbeRequest("https://agentrouter.org", "ar-test-key", "agentrouter", "agentrouter/claude-3-5-sonnet", nil)
+	if err != nil {
+		t.Fatalf("unexpected error for agentrouter: %v", err)
+	}
+	if !strings.HasSuffix(arReq.URL, "/v1/messages") {
+		t.Errorf("expected agentrouter URL ending in /v1/messages, got %s", arReq.URL)
+	}
+	if arReq.Headers["x-api-key"] != "ar-test-key" {
+		t.Errorf("expected x-api-key header for agentrouter, got %v", arReq.Headers["x-api-key"])
+	}
+}
+

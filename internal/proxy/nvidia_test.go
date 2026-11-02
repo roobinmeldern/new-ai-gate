@@ -78,11 +78,11 @@ func TestSupportsNvidiaReasoning_FalseNegatives(t *testing.T) {
 
 func TestSanitizeNvidiaRequest_StripsUnsupportedFields(t *testing.T) {
 	input := map[string]interface{}{
-		"model":            "thinkingmachines/inkling",
-		"messages":         []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
-		"temperature":      0.7,
-		"max_tokens":       512,
-		"stream":           false,
+		"model":       "thinkingmachines/inkling",
+		"messages":    []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+		"temperature": 0.7,
+		"max_tokens":  512,
+		"stream":      false,
 		// OpenAI-only fields that NVIDIA rejects:
 		"stream_options":      map[string]interface{}{"include_usage": true},
 		"logprobs":            true,

@@ -51,28 +51,76 @@ func ProxyAuthWithRedis(tenantCache *cache.RedisTenantCache, adminAPIKey ...stri
 	return proxyAuthWith(tenantCache, adminKey)
 }
 
+// isAnthropicRequest returns true when the request targets the Anthropic Messages API
+// (/v1/messages or /v1/messages/*) or carries an explicit anthropic-version header.
+// Used to select the error envelope format: Anthropic clients expect
+// {"type":"error","error":{...}} while OpenAI-compatible clients expect flat
+// {"error": ...} objects.
+func isAnthropicRequest(c *gin.Context) bool {
+	p := c.Request.URL.Path
+	for strings.HasPrefix(p, "/v1") {
+		p = strings.TrimPrefix(p, "/v1")
+	}
+	return strings.HasPrefix(p, "/messages") || c.GetHeader("anthropic-version") != ""
+}
+
+// abortWithProtocolError writes an Anthropic-formatted error envelope for Anthropic
+// requests, or the existing flat JSON error object for OpenAI-compatible requests.
+//
+// Anthropic envelope:
+//
+//	{"type":"error","error":{"type":"<anthropicErrType>","message":"<message>"}}
+//
+// OpenAI envelope (unchanged behavior): {"error":"<message>"} plus any extra
+// fields supplied in extraFields[0] (e.g. "limit", "retry_after" for 429s).
+func abortWithProtocolError(c *gin.Context, status int, anthropicErrType, message string, extraFields ...gin.H) {
+	if isAnthropicRequest(c) {
+		c.AbortWithStatusJSON(status, gin.H{
+			"type": "error",
+			"error": gin.H{
+				"type":    anthropicErrType,
+				"message": message,
+			},
+		})
+		return
+	}
+	if len(extraFields) > 0 {
+		payload := extraFields[0]
+		payload["error"] = message
+		c.AbortWithStatusJSON(status, payload)
+		return
+	}
+	c.AbortWithStatusJSON(status, gin.H{"error": message})
+}
+
 func proxyAuthWith(lookup tenantLookup, adminAPIKey string) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		var apiKey string
+
+		// Dual-header key extraction:
+		//   1. Authorization: Bearer <key>   (OpenAI-compatible clients, admin tools)
+		//   2. x-api-key: <key>              (Anthropic SDKs, Claude Code CLI, Cursor, Cline)
+		// Authorization wins when both are present; a malformed Authorization
+		// header is rejected even when x-api-key is set (explicit-but-broken
+		// credentials must never silently fall through to another source).
 		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"error": "missing Authorization header",
-			})
-			return
-		}
-
-		if !strings.HasPrefix(authHeader, "Bearer ") {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"error": "invalid Authorization format, expected 'Bearer <key>'",
-			})
-			return
-		}
-		apiKey := authHeader[7:]
-
-		if apiKey == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"error": "empty API key",
-			})
+		if authHeader != "" {
+			if !strings.HasPrefix(authHeader, "Bearer ") {
+				abortWithProtocolError(c, http.StatusUnauthorized, "authentication_error",
+					"invalid Authorization format, expected 'Bearer <key>'")
+				return
+			}
+			apiKey = strings.TrimSpace(authHeader[7:])
+			if apiKey == "" {
+				abortWithProtocolError(c, http.StatusUnauthorized, "authentication_error",
+					"empty API key")
+				return
+			}
+		} else if xApiKey := strings.TrimSpace(c.GetHeader("x-api-key")); xApiKey != "" {
+			apiKey = xApiKey
+		} else {
+			abortWithProtocolError(c, http.StatusUnauthorized, "authentication_error",
+				"missing Authorization header")
 			return
 		}
 
@@ -92,16 +140,12 @@ func proxyAuthWith(lookup tenantLookup, adminAPIKey string) gin.HandlerFunc {
 		cancel()
 
 		if !found {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"error": "invalid API key",
-			})
+			abortWithProtocolError(c, http.StatusUnauthorized, "authentication_error", "invalid API key")
 			return
 		}
 
 		if !tenant.IsActive {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-				"error": "account is suspended",
-			})
+			abortWithProtocolError(c, http.StatusForbidden, "permission_error", "account is suspended")
 			return
 		}
 

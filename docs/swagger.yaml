@@ -808,6 +808,113 @@ paths:
       summary: Proxy AI request
       tags:
       - Proxy
+  /v1/messages:
+    post:
+      consumes:
+      - application/json
+      description: Anthropic Messages API — handles streaming SSE and non-streaming requests across any configured model pool
+      parameters:
+      - description: Anthropic API Key (virtual API key)
+        in: header
+        name: x-api-key
+        required: false
+        type: string
+      - description: Anthropic Version Header (e.g. 2023-06-01)
+        in: header
+        name: anthropic-version
+        required: false
+        type: string
+      - description: Bearer virtual-api-key (optional alternative to x-api-key)
+        in: header
+        name: Authorization
+        required: false
+        type: string
+      - description: Anthropic Messages Request Payload
+        in: body
+        name: body
+        required: true
+        schema:
+          type: object
+      produces:
+      - application/json
+      - text/event-stream
+      responses:
+        "200":
+          description: Successful Anthropic Message response (or SSE stream)
+          schema:
+            type: object
+      summary: Create an Anthropic Message
+      tags:
+      - Anthropic Front API
+  /v1/messages/count_tokens:
+    post:
+      consumes:
+      - application/json
+      description: Anthropic Count Tokens API — returns estimated input tokens
+      parameters:
+      - description: Anthropic API Key
+        in: header
+        name: x-api-key
+        required: false
+        type: string
+      - description: Anthropic Version Header
+        in: header
+        name: anthropic-version
+        required: false
+        type: string
+      - description: Anthropic Request Payload
+        in: body
+        name: body
+        required: true
+        schema:
+          type: object
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Input tokens estimation
+          schema:
+            properties:
+              input_tokens:
+                type: integer
+            type: object
+      summary: Count tokens for an Anthropic Message request
+      tags:
+      - Anthropic Front API
+  /v1/models:
+    get:
+      description: List configured active model pools with detected capabilities in dual OpenAI & Anthropic compatible format
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Model list with OpenAI and Anthropic fields
+          schema:
+            type: object
+      summary: List models
+      tags:
+      - Models
+  /v1/models/{model}:
+    get:
+      description: Retrieve model details by model ID (including slash-prefixed IDs)
+      parameters:
+      - description: Model ID or pattern
+        in: path
+        name: model
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Model details
+          schema:
+            type: object
+        "404":
+          description: Model not found
+      summary: Get model details
+      tags:
+      - Models
 securityDefinitions:
   BearerAuth:
     description: Enter your API key with the "Bearer " prefix, e.g. "Bearer cag_xxxx"

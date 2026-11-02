@@ -589,6 +589,12 @@ func (h *Handler) geminiSDKStream(
 	tmx := transmux.NewGeminiTransmuxer()
 	defer tmx.Close()
 
+	var anthropicEnc *transmux.AnthropicStreamEncoder
+	if pctx.anthropicFront {
+		msgID := "msg_gate_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+		anthropicEnc = transmux.NewAnthropicStreamEncoder(msgID, pctx.requestedModel, pctx.anthropicInputTokens)
+	}
+
 	maxFailoverAttempts := 5
 	attempt := 0
 	emittedText := ""
@@ -656,7 +662,7 @@ func (h *Handler) geminiSDKStream(
 
 			// Append the required user instruction turn to force continuation
 			runContents = append(runContents, &genai.Content{
-				Role:  genai.RoleUser,
+				Role: genai.RoleUser,
 				Parts: []*genai.Part{
 					{
 						Text: "[SYSTEM CONTEXT: Your previous output was cut off mid-generation due to a network dropout. Continue generating the response precisely from the last character above. Do NOT output any introductory remarks, do NOT repeat any code, and do NOT wrap code inside markdown blocks. Resume the code output directly.]",
@@ -767,11 +773,21 @@ func (h *Handler) geminiSDKStream(
 
 			writeHeaders()
 
-			c.Writer.Write([]byte("data: "))  //nolint:errcheck
-			c.Writer.Write(translated)        //nolint:errcheck
-			c.Writer.Write([]byte("\n\n"))    //nolint:errcheck
-			if hasFlusher {
-				flusher.Flush()
+			if pctx.anthropicFront && anthropicEnc != nil {
+				anthBytes := anthropicEnc.EncodeOpenAIChunk(translated)
+				if len(anthBytes) > 0 {
+					c.Writer.Write(anthBytes) //nolint:errcheck
+					if hasFlusher {
+						flusher.Flush()
+					}
+				}
+			} else {
+				c.Writer.Write([]byte("data: ")) //nolint:errcheck
+				c.Writer.Write(translated)       //nolint:errcheck
+				c.Writer.Write([]byte("\n\n"))   //nolint:errcheck
+				if hasFlusher {
+					flusher.Flush()
+				}
 			}
 		}
 
@@ -782,25 +798,35 @@ func (h *Handler) geminiSDKStream(
 
 		if streamErr == nil {
 			// Stream completed successfully!
-			// Flush any remaining buffered text from the sanitizer (e.g. short streams)
-			if flushedText := sanitizer.Flush(); flushedText != "" {
-				responseBuilder.WriteString(flushedText)
-				emittedText += flushedText
-				tokenEstimate++
-				hasEmittedValidData = true
-
-				writeHeaders()
-
-				modelName := pctx.requestedModel
-				if modelName == "" {
-					modelName = pctx.model
+			if pctx.anthropicFront && anthropicEnc != nil {
+				finalBytes := anthropicEnc.Finalize()
+				if len(finalBytes) > 0 {
+					c.Writer.Write(finalBytes) //nolint:errcheck
+					if hasFlusher {
+						flusher.Flush()
+					}
 				}
-				fakeChunk := fmt.Sprintf(`{"id":"chatcmpl-gate","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":%q}}],"model":%q}`, flushedText, modelName)
-				c.Writer.Write([]byte("data: "))            //nolint:errcheck
-				c.Writer.Write([]byte(fakeChunk))           //nolint:errcheck
-				c.Writer.Write([]byte("\n\n"))               //nolint:errcheck
-				if hasFlusher {
-					flusher.Flush()
+			} else {
+				// Flush any remaining buffered text from the sanitizer (e.g. short streams)
+				if flushedText := sanitizer.Flush(); flushedText != "" {
+					responseBuilder.WriteString(flushedText)
+					emittedText += flushedText
+					tokenEstimate++
+					hasEmittedValidData = true
+
+					writeHeaders()
+
+					modelName := pctx.requestedModel
+					if modelName == "" {
+						modelName = pctx.model
+					}
+					fakeChunk := fmt.Sprintf(`{"id":"chatcmpl-gate","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":%q}}],"model":%q}`, flushedText, modelName)
+					c.Writer.Write([]byte("data: "))  //nolint:errcheck
+					c.Writer.Write([]byte(fakeChunk)) //nolint:errcheck
+					c.Writer.Write([]byte("\n\n"))    //nolint:errcheck
+					if hasFlusher {
+						flusher.Flush()
+					}
 				}
 			}
 			break
@@ -881,9 +907,11 @@ func (h *Handler) geminiSDKStream(
 		return http.StatusBadGateway, body, nil
 	}
 
-	c.Writer.Write([]byte("data: [DONE]\n\n")) //nolint:errcheck
-	if hasFlusher {
-		flusher.Flush()
+	if !pctx.anthropicFront {
+		c.Writer.Write([]byte("data: [DONE]\n\n")) //nolint:errcheck
+		if hasFlusher {
+			flusher.Flush()
+		}
 	}
 
 	type streamResult struct {
@@ -1106,7 +1134,3 @@ func stripLeadingFence(cleanText string) string {
 	}
 	return string(runes[startIdx:])
 }
-
-
-
-

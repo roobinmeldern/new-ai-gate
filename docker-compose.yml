@@ -1,44 +1,60 @@
-version: "3.8"
-
 services:
-  # PostgreSQL database
   postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg18
+    container_name: clever-ai-gate-db
+    restart: unless-stopped
     environment:
       POSTGRES_DB: clever_ai_gate
       POSTGRES_USER: gateway
-      POSTGRES_PASSWORD: localdevpassword
+      POSTGRES_PASSWORD: gateway_secure_pass_2026
     ports:
-      - "5432:5432"
+      - "5434:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql
+      - ./dbbackup:/backup
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U gateway -d clever_ai_gate"]
       interval: 5s
       timeout: 3s
-      retries: 5
+      retries: 10
+      start_period: 10s
+    command: >
+      postgres
+        -c shared_buffers=256MB
+        -c max_connections=100
+        -c work_mem=16MB
 
-  # Clever AI Gate application
+  redis:
+    image: redis:7-alpine
+    container_name: clever-ai-gate-redis
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+
   app:
     build:
       context: .
       dockerfile: Dockerfile
+    container_name: clever-ai-gate-app
+    restart: unless-stopped
     ports:
       - "8080:8080"
-    environment:
-      PORT: "8080"
-      GIN_MODE: "debug"
-      DATABASE_URL: "postgres://gateway:localdevpassword@postgres:5432/clever_ai_gate?sslmode=disable"
-      MASTER_ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-      ADMIN_API_KEY: "admin_local_dev_key_1234567890"
-      LOG_LEVEL: "debug"
-      CACHE_MAX_SIZE_MB: "64"
-      TELEMETRY_FLUSH_INTERVAL: "5s"
-      TELEMETRY_BATCH_SIZE: "100"
+    env_file:
+      - .env
     depends_on:
       postgres:
         condition: service_healthy
-    restart: unless-stopped
+      redis:
+        condition: service_healthy
 
 volumes:
   pgdata:
+  redisdata:

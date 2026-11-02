@@ -35,12 +35,16 @@ func Recovery(logger *zap.Logger) gin.HandlerFunc {
 }
 
 // CORS returns a middleware that handles Cross-Origin Resource Sharing.
-// Required for the admin UI panel to communicate with the API.
+// Required for the admin UI panel to communicate with the API, and for
+// browser-based Anthropic SDK clients that target /v1/messages with
+// x-api-key / anthropic-version / anthropic-beta headers (which trigger
+// CORS preflights and need the headers echoed on actual responses).
 func CORS() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept")
+		c.Header("Access-Control-Allow-Headers",
+			"Authorization, Content-Type, Accept, x-api-key, anthropic-version, anthropic-beta, X-Request-ID")
 		c.Header("Access-Control-Max-Age", "86400")
 
 		if c.Request.Method == "OPTIONS" {

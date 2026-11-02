@@ -82,9 +82,9 @@ func translateOneMinAICode(entry credentials.OneMinAIModelEntry, body []byte) ([
 	prompt := buildPromptFromMessages(body)
 
 	req := map[string]interface{}{
-		"type":            entry.Feature,
-		"model":           entry.Model,
-		"conversationId":  entry.Feature,
+		"type":           entry.Feature,
+		"model":          entry.Model,
+		"conversationId": entry.Feature,
 		"promptObject": map[string]interface{}{
 			"prompt": prompt,
 		},
@@ -532,9 +532,9 @@ func translateOneMinAIChatResponse(entry credentials.OneMinAIModelEntry, body []
 	}
 
 	resp := map[string]interface{}{
-		"id":      "1minai-" + entry.Pattern,
-		"object":  "chat.completion",
-		"model":   entry.Pattern,
+		"id":     "1minai-" + entry.Pattern,
+		"object": "chat.completion",
+		"model":  entry.Pattern,
 		"choices": []map[string]interface{}{
 			{
 				"index": 0,

@@ -593,20 +593,33 @@ func DeleteCredentialsBulk(ctx context.Context, pool *pgxpool.Pool, ids []int) e
 // --- Bulk Loading (for cache warm-up) ---
 
 // LoadAllPoolsWithCredentials loads all model pools and their credentials
-// for initial cache population at startup.
+// for initial cache population at startup in two fast queries instead of N+1 queries.
 func LoadAllPoolsWithCredentials(ctx context.Context, pool *pgxpool.Pool) ([]*ModelPoolRow, map[int][]*CredentialRow, error) {
 	pools, err := ListModelPools(ctx, pool)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	credsByPool := make(map[int][]*CredentialRow)
-	for _, p := range pools {
-		creds, err := ListCredentialsByPool(ctx, pool, p.ID)
-		if err != nil {
-			return nil, nil, err
+	rows, err := pool.Query(ctx, `
+		SELECT id, pool_id, provider, encrypted_key, base_url, weight, 
+		       is_healthy, last_error, created_at::text, prefix
+		FROM credentials ORDER BY pool_id, id
+	`)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to query all credentials: %w", err)
+	}
+	defer rows.Close()
+
+	credsByPool := make(map[int][]*CredentialRow, len(pools))
+	for rows.Next() {
+		c := &CredentialRow{}
+		if err := rows.Scan(&c.ID, &c.PoolID, &c.Provider, &c.EncryptedKey, &c.BaseURL, &c.Weight, &c.IsHealthy, &c.LastError, &c.CreatedAt, &c.Prefix); err != nil {
+			return nil, nil, fmt.Errorf("failed to scan credential: %w", err)
 		}
-		credsByPool[p.ID] = creds
+		credsByPool[c.PoolID] = append(credsByPool[c.PoolID], c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("error reading credentials: %w", err)
 	}
 
 	return pools, credsByPool, nil

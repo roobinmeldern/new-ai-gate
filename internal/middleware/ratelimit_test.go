@@ -3,6 +3,7 @@ package middleware
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -177,5 +178,97 @@ func TestRateLimiter_RetryAfterHeader(t *testing.T) {
 	}
 	if remaining := w.Header().Get("X-RateLimit-Remaining"); remaining != "0" {
 		t.Errorf("expected X-RateLimit-Remaining '0', got %q", remaining)
+	}
+}
+
+// TestRateLimiter_AnthropicRateLimitEnvelope verifies that 429 responses for
+// Anthropic requests (/v1/messages) use the nested rate_limit_error envelope
+// while preserving the Retry-After and X-RateLimit-* headers.
+func TestRateLimiter_AnthropicRateLimitEnvelope(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rl := NewRateLimiter(2)
+
+	request := func() *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Set("tenant_id", "tenant-anthropic-rl")
+		c.Set("tenant_rate_limit", 2)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+		rl.Middleware()(c)
+		return w
+	}
+
+	// Two allowed requests reach the limit.
+	for i := 0; i < 2; i++ {
+		if w := request(); w.Code != http.StatusOK {
+			t.Fatalf("request %d: expected status 200, got %d", i+1, w.Code)
+		}
+	}
+
+	// 3rd request is blocked with the Anthropic envelope.
+	w := request()
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected status 429, got %d", w.Code)
+	}
+
+	body := w.Body.String()
+	for _, want := range []string{
+		`"type":"error"`,
+		`"type":"rate_limit_error"`,
+		`"message":"rate limit exceeded"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected Anthropic envelope containing %s, got %s", want, body)
+		}
+	}
+	if retryAfter := w.Header().Get("Retry-After"); retryAfter == "" {
+		t.Error("expected non-empty Retry-After header on Anthropic 429")
+	}
+	if remaining := w.Header().Get("X-RateLimit-Remaining"); remaining != "0" {
+		t.Errorf("expected X-RateLimit-Remaining '0', got %q", remaining)
+	}
+}
+
+// TestRateLimiter_Flat429BodyPreservedOnOpenAIPath verifies that OpenAI
+// endpoints keep the original flat 429 body {"error","limit","retry_after"}
+// — no Anthropic envelope may leak into the existing protocol.
+func TestRateLimiter_Flat429BodyPreservedOnOpenAIPath(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rl := NewRateLimiter(2)
+
+	var blockedBody string
+	var blockedCode int
+	for i := 0; i < 3; i++ {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Set("tenant_id", "tenant-flat-rl")
+		c.Set("tenant_rate_limit", 2)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		rl.Middleware()(c)
+
+		if i < 2 {
+			if w.Code != http.StatusOK {
+				t.Fatalf("request %d: expected status 200, got %d", i+1, w.Code)
+			}
+			continue
+		}
+		blockedCode = w.Code
+		blockedBody = w.Body.String()
+	}
+
+	if blockedCode != http.StatusTooManyRequests {
+		t.Fatalf("expected status 429, got %d", blockedCode)
+	}
+	for _, want := range []string{
+		`"error":"rate limit exceeded"`,
+		`"limit":2`,
+		`"retry_after":`,
+	} {
+		if !strings.Contains(blockedBody, want) {
+			t.Fatalf("expected flat 429 body to contain %s, got %s", want, blockedBody)
+		}
+	}
+	if strings.Contains(blockedBody, `"type":"error"`) || strings.Contains(blockedBody, "rate_limit_error") {
+		t.Fatalf("OpenAI path must keep the flat error format, got %s", blockedBody)
 	}
 }

@@ -129,7 +129,12 @@ func (r *Rewriter) RewriteHeaders(req *http.Request, provider, apiKey string, so
 	switch provider {
 	case "anthropic":
 		req.Header.Set("x-api-key", apiKey)
-		req.Header.Set("anthropic-version", "2023-06-01")
+		// Honor the client's anthropic-version when sent; default otherwise.
+		if v := sourceHeaders.Get("anthropic-version"); v != "" {
+			req.Header.Set("anthropic-version", v)
+		} else {
+			req.Header.Set("anthropic-version", "2023-06-01")
+		}
 		// Enable extended thinking if present in original request
 		if sourceHeaders.Get("anthropic-beta") != "" {
 			req.Header.Set("anthropic-beta", sourceHeaders.Get("anthropic-beta"))

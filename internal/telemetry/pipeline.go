@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"github.com/skadraneshghn/clever-ai-gate/internal/database"
@@ -320,7 +321,9 @@ func (p *Pipeline) flush(batch []*LogEntry) {
 		var logID int64
 		var tenantID interface{}
 		if entry.TenantID != "" {
-			tenantID = entry.TenantID
+			if _, err := uuid.Parse(entry.TenantID); err == nil {
+				tenantID = entry.TenantID
+			}
 		}
 
 		var errMsg interface{}

@@ -33,3 +33,10 @@ server
 internal/playground/dist/
 playground/.svelte-kit/
 playground/node_modules/
+
+# Logs
+logs/
+*.log
+
+# Claude flow
+.claude-flow/

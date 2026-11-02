@@ -412,4 +412,3 @@ func TestSanitizeJiekouRequest_KimiFieldsRemoved(t *testing.T) {
 	// temperature within [0,1] should be preserved
 	assertFloat(t, out, "temperature", 0.8)
 }
-

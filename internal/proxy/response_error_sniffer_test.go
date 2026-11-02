@@ -284,7 +284,7 @@ func TestSniffStream_FastCommitOnFirstContent(t *testing.T) {
 	if r.idx > 2 {
 		t.Errorf("expected fast commit after the first content event, consumed %d chunks", r.idx)
 	}
-	combined, err := io.ReadAll(io.MultiReader(strings.NewReader(string(res.replay)), r))
+	combined, err := io.ReadAll(res.body)
 	if err != nil {
 		t.Fatalf("read combined: %v", err)
 	}
@@ -335,7 +335,7 @@ func TestSniffStream_WatchKeywordThenLongContentClean(t *testing.T) {
 	if res.verdict != nil {
 		t.Fatalf("watch-keyword legit stream must not be flagged: %+v", res.verdict)
 	}
-	combined, err := io.ReadAll(io.MultiReader(strings.NewReader(string(res.replay)), r))
+	combined, err := io.ReadAll(res.body)
 	if err != nil {
 		t.Fatalf("read combined: %v", err)
 	}
@@ -356,7 +356,7 @@ func TestSniffStream_RawCapCommitClean(t *testing.T) {
 	if res.verdict != nil {
 		t.Fatalf("role-only stream must not be flagged: %+v", res.verdict)
 	}
-	combined, err := io.ReadAll(io.MultiReader(strings.NewReader(string(res.replay)), r))
+	combined, err := io.ReadAll(res.body)
 	if err != nil {
 		t.Fatalf("read combined: %v", err)
 	}
@@ -381,7 +381,7 @@ func TestSniffStream_LargeLegitContentCommitsFast(t *testing.T) {
 	if r.idx > 1 {
 		t.Errorf("expected commit after the first content chunk, consumed %d chunks", r.idx)
 	}
-	combined, err := io.ReadAll(io.MultiReader(strings.NewReader(string(res.replay)), r))
+	combined, err := io.ReadAll(res.body)
 	if err != nil {
 		t.Fatalf("read combined: %v", err)
 	}
@@ -566,9 +566,6 @@ func TestExecuteWithRetry_RotatesOnSuccessBodyError(t *testing.T) {
 	}
 }
 
-
-
-
 func TestSniffStream_CleanReplayByteExact(t *testing.T) {
 	stream := "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n" +
 		"data: {\"choices\":[{\"delta\":{\"content\":\" world from a healthy model!\"},\"finish_reason\":\"stop\"}]}\n\n" +
@@ -579,7 +576,7 @@ func TestSniffStream_CleanReplayByteExact(t *testing.T) {
 		t.Fatalf("clean stream must not be flagged: %+v", res.verdict)
 	}
 	// Replay + remaining unread bytes must equal the original stream exactly.
-	combined, err := io.ReadAll(io.MultiReader(strings.NewReader(string(res.replay)), body))
+	combined, err := io.ReadAll(res.body)
 	if err != nil {
 		t.Fatalf("read combined: %v", err)
 	}
@@ -587,5 +584,3 @@ func TestSniffStream_CleanReplayByteExact(t *testing.T) {
 		t.Fatal("clean stream replay is not byte-exact")
 	}
 }
-
-

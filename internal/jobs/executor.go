@@ -31,7 +31,7 @@ func RegisterBuiltinExecutors(reg *Registry, db *pgxpool.Pool, rdb *redis.Client
 	reg.Register("job_log_cleanup", newJobLogCleanupExecutor(db, logger))
 	reg.Register("noop", newNoopExecutor(logger))
 	reg.Register("bulk_pool_health_check", newBulkPoolHealthCheckExecutor(db, rdb, vault, logger))
-	reg.Register("exhaustive_pool_health_check", newExhaustivePoolHealthCheckExecutor(db, logger))
+	reg.Register("exhaustive_pool_health_check", newExhaustivePoolHealthCheckExecutor(db, vault, logger))
 	reg.Register("provider_rediscovery", newProviderRediscoveryExecutor(db, vault, logger))
 
 	logger.Info("built-in job executors registered",
@@ -43,14 +43,14 @@ func RegisterBuiltinExecutors(reg *Registry, db *pgxpool.Pool, rdb *redis.Client
 // Probes every (pool × credential) combination, records sessions and granular results to DB,
 // and streams live progress via SSE.
 
-func newExhaustivePoolHealthCheckExecutor(db *pgxpool.Pool, logger *zap.Logger) ExecutorFunc {
+func newExhaustivePoolHealthCheckExecutor(db *pgxpool.Pool, vault *credentials.Vault, logger *zap.Logger) ExecutorFunc {
 	return func(execCtx *ExecutionContext) (string, error) {
 		ctx := execCtx.Context
 		if ctx == nil {
 			ctx = context.Background()
 		}
 
-		job := NewExhaustiveHealthCheckJob(db, logger, nil)
+		job := NewExhaustiveHealthCheckJob(db, vault, logger, nil)
 		summary, err := job.Run(ctx, "scheduled")
 		if err != nil {
 			return "", err

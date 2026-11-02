@@ -119,11 +119,14 @@ func (rl *RedisRateLimiter) Middleware() gin.HandlerFunc {
 
 		if !allowed {
 			c.Header("Retry-After", "60")
-			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-				"error":       "rate limit exceeded",
-				"limit":       rpmLimit,
-				"retry_after": 60,
-			})
+			// Anthropic clients (/v1/messages) receive the nested error
+			// envelope with type "rate_limit_error"; OpenAI-compatible
+			// clients keep the flat {"error":..., "limit":..., "retry_after":...}.
+			abortWithProtocolError(c, http.StatusTooManyRequests, "rate_limit_error", "rate limit exceeded",
+				gin.H{
+					"limit":       rpmLimit,
+					"retry_after": 60,
+				})
 			return
 		}
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/buger/jsonparser"
@@ -567,6 +568,8 @@ func extractEventContent(evt []byte) (content, errMsg string) {
 // streamSniffResult carries the outcome of sniffing a streaming response.
 // When verdict is nil the stream is clean; replay holds every byte consumed
 // while sniffing and MUST be replayed to the client byte-exactly.
+// body provides the unified, continuous stream (replay prefix followed by pump reads)
+// so that no concurrent reads occur and no bytes are lost.
 type streamSniffResult struct {
 	verdict *successBodyError
 	replay  []byte
@@ -575,6 +578,7 @@ type streamSniffResult struct {
 	// transport failure so the rotation loop moves to the next credential
 	// instead of hanging the client until its own timeout fires.
 	stalled bool
+	body    io.ReadCloser
 }
 
 // streamSniffer holds the incremental state while sniffing a stream.
@@ -709,38 +713,140 @@ func hasWatchKeyword(content string) bool {
 //   - Watch-keywords present but nothing conclusive          → keep buffering,
 //     bounded by the raw cap and the deadline.
 //
-// Reads are pumped through a goroutine so a stalled upstream cannot hold the
-// sniffer (and the whole request) hostage: each Read must produce bytes within
-// streamFirstByteIdleTimeout, otherwise the stream is declared stalled and the
-// caller rotates to another credential. The abandoned pump goroutine exits
-// once the caller closes the response body.
+// streamPipeReader replays the sniffed prefix and then transparently
+// consumes remaining chunks produced by the sniffer's pump goroutine.
+// This prevents concurrent reads on the underlying body and ensures
+// zero bytes are lost between sniffing and streaming relay.
+type streamPipeReader struct {
+	prefix    []byte
+	reqRead   chan<- struct{}
+	reads     <-chan readResult
+	leftover  []byte
+	closer    io.Closer
+	done      chan struct{}
+	closeOnce sync.Once
+	err       error
+}
+
+func (r *streamPipeReader) Read(p []byte) (int, error) {
+	if len(r.prefix) > 0 {
+		n := copy(p, r.prefix)
+		r.prefix = r.prefix[n:]
+		return n, nil
+	}
+	if len(r.leftover) > 0 {
+		n := copy(p, r.leftover)
+		r.leftover = r.leftover[n:]
+		return n, nil
+	}
+	if r.err != nil {
+		return 0, r.err
+	}
+	select {
+	case <-r.done:
+		return 0, io.EOF
+	case r.reqRead <- struct{}{}:
+	}
+
+	select {
+	case <-r.done:
+		return 0, io.EOF
+	case res, ok := <-r.reads:
+		if !ok {
+			return 0, io.EOF
+		}
+		if len(res.buf) > 0 {
+			n := copy(p, res.buf)
+			if n < len(res.buf) {
+				r.leftover = res.buf[n:]
+			}
+			if res.err != nil {
+				r.err = res.err
+			}
+			return n, nil
+		}
+		if res.err != nil {
+			return 0, res.err
+		}
+		return 0, io.EOF
+	}
+}
+
+func (r *streamPipeReader) Close() error {
+	r.closeOnce.Do(func() {
+		close(r.done)
+	})
+	if r.closer != nil {
+		return r.closer.Close()
+	}
+	return nil
+}
+
+type readResult struct {
+	buf []byte
+	err error
+}
+
+// sniffStreamForError buffers the opening of a streaming 2xx response (SSE,
+// Ollama NDJSON, bare JSON) to detect HTTP 200 OK error bodies.
 func sniffStreamForError(body io.Reader) *streamSniffResult {
 	s := &streamSniffer{}
 	start := time.Now()
 	spins := 0
 
-	type readResult struct {
-		buf []byte
-		err error
+	var closer io.Closer
+	if c, ok := body.(io.Closer); ok {
+		closer = c
 	}
-	reads := make(chan readResult, 1)
+
+	reqRead := make(chan struct{})
+	reads := make(chan readResult)
+	done := make(chan struct{})
+
 	go func() {
 		tmp := make([]byte, 16*1024)
 		for {
+			select {
+			case <-reqRead:
+			case <-done:
+				return
+			}
 			n, err := body.Read(tmp)
-			// Copy out of tmp before handing over — the next Read reuses it.
-			buf := make([]byte, n)
-			copy(buf, tmp[:n])
-			reads <- readResult{buf: buf, err: err}
+			var buf []byte
+			if n > 0 {
+				buf = make([]byte, n)
+				copy(buf, tmp[:n])
+			}
+			select {
+			case reads <- readResult{buf: buf, err: err}:
+			case <-done:
+				return
+			}
 			if err != nil {
 				return
 			}
 		}
 	}()
 
+	makePipe := func() *streamPipeReader {
+		return &streamPipeReader{
+			prefix:  s.raw,
+			reqRead: reqRead,
+			reads:   reads,
+			closer:  closer,
+			done:    done,
+		}
+	}
+
 	var n int
 	var readErr error
 	for {
+		select {
+		case reqRead <- struct{}{}:
+		case <-done:
+			return &streamSniffResult{verdict: nil, replay: s.raw, stalled: true, body: makePipe()}
+		}
+
 		select {
 		case r := <-reads:
 			n, readErr = len(r.buf), r.err
@@ -751,7 +857,8 @@ func sniffStreamForError(body io.Reader) *streamSniffResult {
 			// Upstream accepted the request but went silent before producing
 			// the first byte — a retryable transport failure, not an error
 			// body. The rotation loop moves to the next credential.
-			return &streamSniffResult{verdict: nil, replay: s.raw, stalled: true}
+			close(done)
+			return &streamSniffResult{verdict: nil, replay: s.raw, stalled: true, body: makePipe()}
 		}
 
 		// Unambiguous error events fire immediately.
@@ -759,6 +866,7 @@ func sniffStreamForError(body io.Reader) *streamSniffResult {
 			return &streamSniffResult{
 				verdict: &successBodyError{Reason: "json_error_object", Message: s.eventErr},
 				replay:  s.raw,
+				body:    makePipe(),
 			}
 		}
 
@@ -774,6 +882,7 @@ func sniffStreamForError(body io.Reader) *streamSniffResult {
 			return &streamSniffResult{
 				verdict: &successBodyError{Reason: "pollinations_low_balance", Message: msg},
 				replay:  s.raw,
+				body:    makePipe(),
 			}
 		}
 
@@ -785,42 +894,37 @@ func sniffStreamForError(body io.Reader) *streamSniffResult {
 				return &streamSniffResult{
 					verdict: &successBodyError{Reason: "credit_balance_error_text", Message: contentText},
 					replay:  s.raw,
+					body:    makePipe(),
 				}
 			}
 			// Bare JSON documents get the full non-stream classifier.
 			if !s.sawSSE && len(s.raw) > 0 && s.raw[0] == '{' {
 				if v := detectSuccessBodyError(s.raw, "", true); v != nil {
-					return &streamSniffResult{verdict: v, replay: s.raw}
+					return &streamSniffResult{verdict: v, replay: s.raw, body: makePipe()}
 				}
 			}
-			return &streamSniffResult{verdict: nil, replay: s.raw}
+			return &streamSniffResult{verdict: nil, replay: s.raw, body: makePipe()}
 		}
 
 		// Clean-commit conditions (buffered bytes are replayed byte-exactly).
 		if len(contentText) >= streamSniffCommitChars {
-			return &streamSniffResult{verdict: nil, replay: s.raw}
+			return &streamSniffResult{verdict: nil, replay: s.raw, body: makePipe()}
 		}
 		if len(s.raw) >= streamSniffRawCap {
-			return &streamSniffResult{verdict: nil, replay: s.raw}
+			return &streamSniffResult{verdict: nil, replay: s.raw, body: makePipe()}
 		}
 		if contentText != "" && !hasWatchKeyword(contentText) {
-			return &streamSniffResult{verdict: nil, replay: s.raw}
+			return &streamSniffResult{verdict: nil, replay: s.raw, body: makePipe()}
 		}
 		if time.Since(start) > streamSniffDeadline {
-			return &streamSniffResult{verdict: nil, replay: s.raw}
+			return &streamSniffResult{verdict: nil, replay: s.raw, body: makePipe()}
 		}
 
 		if n == 0 {
 			spins++
 			if spins > 4096 { // pathological reader — bail out cleanly
-				return &streamSniffResult{verdict: nil, replay: s.raw}
+				return &streamSniffResult{verdict: nil, replay: s.raw, body: makePipe()}
 			}
 		}
 	}
 }
-
-
-
-
-
-

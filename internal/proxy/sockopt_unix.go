@@ -10,7 +10,7 @@ const (
 	// On systems that don't support it (e.g. macOS), SetsockoptInt returns
 	// an error that the caller silently ignores.
 	tcpQuickAck        = 12
-	tcpFastOpenConnect  = 30
+	tcpFastOpenConnect = 30
 )
 
 // setTCPNoDelay disables Nagle's algorithm on the given socket file descriptor.

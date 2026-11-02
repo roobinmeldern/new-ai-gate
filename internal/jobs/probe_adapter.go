@@ -49,6 +49,10 @@ func CleanUpstreamModel(modelPattern, providerID string) string {
 		model = strings.TrimPrefix(model, "gemini/")
 	case "jiekou":
 		model = strings.TrimPrefix(model, "jiekou/")
+	case "anthropic":
+		model = strings.TrimPrefix(model, "anthropic/")
+	case "agentrouter":
+		model = strings.TrimPrefix(model, "agentrouter/")
 	}
 
 	return model
@@ -68,6 +72,36 @@ func BuildAdaptiveProbeRequest(baseURL, apiKey, providerID, modelPattern string,
 		"Content-Type":  "application/json",
 		"Authorization": "Bearer " + apiKey,
 		"User-Agent":    "CleverAIGate-HealthProbe/1.0",
+	}
+
+	// 0. ANTHROPIC & AGENTROUTER NATIVE ADAPTER
+	// Anthropic and AgentRouter native endpoints expect POST to /v1/messages with
+	// x-api-key and anthropic-version: 2023-06-01 headers (not Authorization: Bearer).
+	if provider == "anthropic" || provider == "agentrouter" ||
+		strings.Contains(cleanBaseURL, "anthropic.com") ||
+		strings.Contains(cleanBaseURL, "agentrouter.org") {
+		reqURL := cleanBaseURL + "/v1/messages"
+		if strings.HasSuffix(cleanBaseURL, "/v1") {
+			reqURL = cleanBaseURL + "/messages"
+		}
+		antHeaders := map[string]string{
+			"Content-Type":      "application/json",
+			"x-api-key":         apiKey,
+			"anthropic-version": "2023-06-01",
+			"User-Agent":        "CleverAIGate-HealthProbe/1.0",
+		}
+		bodyMap := map[string]interface{}{
+			"model":      targetModel,
+			"max_tokens": 1,
+			"messages": []map[string]interface{}{
+				{"role": "user", "content": "ping"},
+			},
+		}
+		jsonBody, err := json.Marshal(bodyMap)
+		if err != nil {
+			return nil, fmt.Errorf("marshal anthropic probe: %w", err)
+		}
+		return &ModelProbeRequest{Method: http.MethodPost, URL: reqURL, Headers: antHeaders, Body: jsonBody}, nil
 	}
 
 	// 1. 1MIN.AI SPECIAL ADAPTER

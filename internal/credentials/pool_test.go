@@ -180,3 +180,55 @@ func BenchmarkAcquireActiveToken_Parallel(b *testing.B) {
 		}
 	})
 }
+
+func TestAcquireBatchActiveTokens(t *testing.T) {
+	creds := []*RuntimeCredential{
+		{ID: 1, APIKey: "key1", Provider: "cleanapis", BaseURL: "https://cleanapis.com", Weight: 2},
+		{ID: 2, APIKey: "key2", Provider: "cleanapis", BaseURL: "https://cleanapis.com", Weight: 1},
+		{ID: 3, APIKey: "key3", Provider: "cleanapis", BaseURL: "https://cleanapis.com", Weight: 1},
+		{ID: 4, APIKey: "key4", Provider: "cleanapis", BaseURL: "https://cleanapis.com", Weight: 1},
+	}
+	fallbackCreds := []*RuntimeCredential{
+		{ID: 99, APIKey: "fb-key", Provider: "fallback", BaseURL: "https://fallback.com", Weight: 1},
+	}
+	fbPool := NewBalancedPool("model", "round-robin", fallbackCreds, nil)
+	pool := NewBalancedPool("model", "round-robin", creds, fbPool)
+
+	// Ring length is 2 + 1 + 1 + 1 = 5. Cred ID 1 is duplicated in the ring.
+	// Acquire batch of 5: should return distinct physical credentials (IDs: 1, 2, 3, 4 - count 4)
+	batch := pool.AcquireBatchActiveTokens(5, nil)
+	if len(batch) != 4 {
+		t.Fatalf("expected 4 distinct active credentials in batch, got %d", len(batch))
+	}
+	seenIDs := make(map[int]bool)
+	for _, res := range batch {
+		if seenIDs[res.Credential.ID] {
+			t.Errorf("duplicate physical credential ID %d in batch", res.Credential.ID)
+		}
+		seenIDs[res.Credential.ID] = true
+	}
+
+	// Now penalize ID 2 and exclude index of ID 3
+	pool.PenalizeToken(batch[1].Index, 10*time.Second) // penalize one
+	excluded := map[int]bool{batch[2].Index: true}
+
+	batch2 := pool.AcquireBatchActiveTokens(5, excluded)
+	for _, res := range batch2 {
+		if res.Credential.ID == 2 {
+			t.Errorf("cooled-down credential 2 was returned in batch")
+		}
+		if res.Index == batch[2].Index {
+			t.Errorf("excluded index %d was returned in batch", res.Index)
+		}
+	}
+
+	// Ensure it does NOT cascade to fallback pool
+	for _, cand := range creds {
+		cand.CooldownUntil = time.Now().Add(10 * time.Minute).UnixNano()
+	}
+	batchEmpty := pool.AcquireBatchActiveTokens(5, nil)
+	if len(batchEmpty) != 0 {
+		t.Errorf("expected empty batch when all current pool tokens are cooled down, got %d (must not cascade to fallback)", len(batchEmpty))
+	}
+}
+

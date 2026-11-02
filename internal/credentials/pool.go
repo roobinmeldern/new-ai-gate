@@ -113,6 +113,49 @@ func (p *BalancedChannelPool) AcquireActiveToken() *AcquireResult {
 	return nil // All pools exhausted
 }
 
+// AcquireBatchActiveTokens acquires up to maxCount distinct active credentials
+// from the pool that are past cooldown and not in excludedIndices.
+// It only inspects the current pool (does NOT cascade to FallbackPool) so that the
+// caller can evaluate all keys of the current provider before switching.
+func (p *BalancedChannelPool) AcquireBatchActiveTokens(maxCount int, excludedIndices map[int]bool) []*AcquireResult {
+	if p == nil || p.TotalCount == 0 || maxCount <= 0 {
+		return nil
+	}
+
+	now := time.Now().UnixNano()
+	limit := p.TotalCount
+	baseIdx := atomic.AddUint64(&p.Cursor, uint64(maxCount))
+
+	var results []*AcquireResult
+	seenIndices := make(map[int]bool)
+	seenCredIDs := make(map[int]bool)
+
+	for i := uint64(0); i < limit && len(results) < maxCount; i++ {
+		idx := int((baseIdx + i) % limit)
+		if excludedIndices != nil && excludedIndices[idx] {
+			continue
+		}
+		if seenIndices[idx] {
+			continue
+		}
+		cand := p.Credentials[idx]
+		if cand == nil || seenCredIDs[cand.ID] {
+			continue
+		}
+		if atomic.LoadInt64(&cand.CooldownUntil) <= now {
+			seenIndices[idx] = true
+			seenCredIDs[cand.ID] = true
+			results = append(results, &AcquireResult{
+				Credential: cand,
+				Index:      idx,
+				FromPool:   p,
+			})
+		}
+	}
+
+	return results
+}
+
 // PenalizeToken marks a credential as temporarily unavailable.
 // Called on 429 (rate limit), 500 (server error), or 503 (overloaded) responses.
 // Uses atomic store — no locks, no contention with concurrent readers.
@@ -122,6 +165,21 @@ func (p *BalancedChannelPool) PenalizeToken(index int, duration time.Duration) {
 	}
 	cooldownTime := time.Now().Add(duration).UnixNano()
 	atomic.StoreInt64(&p.Credentials[index].CooldownUntil, cooldownTime)
+}
+
+// PenalizeByProvider marks all credentials in the pool matching the given provider
+// as temporarily unavailable. Used by the circuit breaker to fast-fail an entire provider
+// when consecutive credentials suffer quota depletion, billing suspension, or auth errors.
+func (p *BalancedChannelPool) PenalizeByProvider(provider string, duration time.Duration) {
+	if p == nil {
+		return
+	}
+	cooldownTime := time.Now().Add(duration).UnixNano()
+	for _, cred := range p.Credentials {
+		if cred.Provider == provider {
+			atomic.StoreInt64(&cred.CooldownUntil, cooldownTime)
+		}
+	}
 }
 
 // PenalizeByCredID marks a credential by ID as unavailable until the given

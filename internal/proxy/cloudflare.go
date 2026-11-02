@@ -526,4 +526,3 @@ func sanitizeCloudflareRequest(body []byte) []byte {
 	}
 	return out
 }
-

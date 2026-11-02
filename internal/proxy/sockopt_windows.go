@@ -6,8 +6,8 @@ import "syscall"
 
 const (
 	// Defined here because syscall.TCP_NODELAY is not available on Windows.
-	ipprotoTCP  = 6
-	tcpNoDelay  = 1
+	ipprotoTCP = 6
+	tcpNoDelay = 1
 )
 
 // setTCPNoDelay disables Nagle's algorithm on the given socket file descriptor.

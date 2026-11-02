@@ -21,7 +21,7 @@ func TestModelDisallowsSamplingParams(t *testing.T) {
 		{"cc/claude-opus-5", true},
 		{"anthropic/claude-opus-4.5", true},
 		{"claude-opus-4-5-20251101", true},
-		{"Claude-Opus-5", true}, // case-insensitive
+		{"Claude-Opus-5", true},             // case-insensitive
 		{"claude-opus-4-1-20250805", false}, // Opus 4.1 still honours temperature
 		{"claude-sonnet-5", false},          // no rejection observed — untouched
 		{"gpt-5", false},

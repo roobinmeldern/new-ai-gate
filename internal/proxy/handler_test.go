@@ -469,7 +469,6 @@ func TestFindPoolByPrefix_GenericSlash(t *testing.T) {
 	}
 	defer cacheStore.Close()
 
-
 	cred := &credentials.RuntimeCredential{
 		ID:       1,
 		Provider: "custom",
@@ -592,6 +591,88 @@ func TestListModels_FromCache(t *testing.T) {
 	}
 	if resp.Data[0].Capabilities["vision"] != true {
 		t.Errorf("expected vision capability for gpt-4o")
+	}
+	if resp.Data[0].Type != "model" || resp.Data[0].DisplayName != "gpt-4o" {
+		t.Errorf("expected dual Anthropic fields in ModelDetail, got type=%s, display_name=%s", resp.Data[0].Type, resp.Data[0].DisplayName)
+	}
+	if resp.HasMore != false || resp.FirstID != "gpt-4o" || resp.LastID != "claude-3-5-sonnet" {
+		t.Errorf("expected pagination fields: has_more=false, first_id=gpt-4o, last_id=claude-3-5-sonnet; got %+v", resp)
+	}
+}
+
+func TestGetModel_DualCompatibility(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger := zap.NewNop()
+
+	cfg := &config.Config{CacheMaxSizeMB: 10, CacheNumCounters: 100}
+	cs, err := cache.New(cfg, logger)
+	if err != nil {
+		t.Fatalf("failed to create cache store: %v", err)
+	}
+	defer cs.Close()
+
+	activeModels := []credentials.ActiveModel{
+		{
+			Pattern:      "anthropic/claude-3-7-sonnet",
+			Capabilities: map[string]bool{"thinking": true},
+		},
+	}
+	cs.Set("system:active_models", activeModels, 1000)
+	cs.Wait()
+
+	handler := NewHandler(nil, cs, nil, logger, nil, nil, nil)
+
+	r := gin.New()
+	r.GET("/v1/models/*model", handler.GetModel)
+
+	// Case 1: Existing model found
+	req1 := httptest.NewRequest("GET", "/v1/models/anthropic/claude-3-7-sonnet", nil)
+	w1 := httptest.NewRecorder()
+	r.ServeHTTP(w1, req1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", w1.Code)
+	}
+	var detail ModelDetail
+	if err := json.Unmarshal(w1.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("failed to decode ModelDetail: %v", err)
+	}
+	if detail.ID != "anthropic/claude-3-7-sonnet" || detail.Type != "model" || detail.DisplayName != "anthropic/claude-3-7-sonnet" {
+		t.Errorf("unexpected detail: %+v", detail)
+	}
+	if detail.Capabilities["thinking"] != true {
+		t.Errorf("expected thinking capability to be true")
+	}
+
+	// Case 2: Non-existent model with OpenAI headers -> OpenAI 404
+	req2 := httptest.NewRequest("GET", "/v1/models/unknown-model", nil)
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w2.Code)
+	}
+	var oaErr map[string]interface{}
+	_ = json.Unmarshal(w2.Body.Bytes(), &oaErr)
+	if _, ok := oaErr["error"].(map[string]interface{}); !ok {
+		t.Errorf("expected OpenAI error object, got %s", w2.Body.String())
+	}
+
+	// Case 3: Non-existent model with Anthropic headers -> Anthropic 404
+	req3 := httptest.NewRequest("GET", "/v1/models/unknown-model", nil)
+	req3.Header.Set("x-api-key", "sk-ant-test")
+	req3.Header.Set("anthropic-version", "2023-06-01")
+	w3 := httptest.NewRecorder()
+	r.ServeHTTP(w3, req3)
+	if w3.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w3.Code)
+	}
+	var antErr map[string]interface{}
+	_ = json.Unmarshal(w3.Body.Bytes(), &antErr)
+	if antErr["type"] != "error" {
+		t.Errorf("expected Anthropic error type, got %s", w3.Body.String())
+	}
+	errObj, _ := antErr["error"].(map[string]interface{})
+	if errObj["type"] != "not_found_error" {
+		t.Errorf("expected not_found_error, got %v", errObj["type"])
 	}
 }
 

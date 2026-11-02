@@ -80,8 +80,8 @@ func Load() *Config {
 		GinMode: envStr("GIN_MODE", "release"),
 
 		// Database (required)
-		DatabaseURL: envRequired("DATABASE_URL"),
-		RedisURL:    envStr("REDIS_URL", ""),
+		DatabaseURL: envFirst("DATABASE_URL", "POSTGRESQL_ADDON_URI"),
+		RedisURL:    envStr("REDIS_URL", envStr("REDIS_DIRECT_URI", "")),
 
 		// Redis pool tuning — tuned for Clever Cloud edge
 		RedisPoolSize:     envInt("REDIS_POOL_SIZE", 200),
@@ -159,6 +159,15 @@ func stripInlineComment(val string) string {
 		val = val[:idx]
 	}
 	return strings.TrimSpace(val)
+}
+
+func envFirst(keys ...string) string {
+	for _, key := range keys {
+		if val := stripInlineComment(os.Getenv(key)); val != "" {
+			return val
+		}
+	}
+	panic(fmt.Sprintf("one of required environment variables (%s) is not set", strings.Join(keys, ", ")))
 }
 
 func envRequired(key string) string {
