@@ -54,32 +54,14 @@ func BuildOptimizedTransport(cfg *config.Config, logger *zap.Logger) (*http.Tran
 			return credentials.DialContextResilient(ctx, dialer, network, addr)
 		},
 
-		// DialTLSContext handles all HTTPS connections. This is where we
-		// intercept the address to route through the probed fastest edge IP
-		// while preserving the original hostname for TLS SNI verification.
+		// DialTLSContext handles all HTTPS connections using native DNS resolution
+		// while applying kernel-level socket tuning and TLS SNI verification.
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(addr)
+			host, _, err := net.SplitHostPort(addr)
 			if err != nil {
 				return nil, err
 			}
-
-			// Determine the dial target: fastest probed IP, or original address.
-			target := addr
-			if ip := prober.GetFastestIP(host); ip != "" {
-				target = net.JoinHostPort(ip, port)
-			}
-
-			conn, err := dialTLS(ctx, network, target, host, cfg, applySockopts)
-			if err != nil && target != addr {
-				// Fastest IP failed — fall back to normal DNS resolution.
-				logger.Debug("edge IP failed, falling back to DNS",
-					zap.String("host", host),
-					zap.String("failed_ip", target),
-					zap.Error(err),
-				)
-				conn, err = dialTLS(ctx, network, addr, host, cfg, applySockopts)
-			}
-			return conn, err
+			return dialTLS(ctx, network, addr, host, cfg, applySockopts)
 		},
 
 		MaxIdleConns:          cfg.MaxIdleConns,
